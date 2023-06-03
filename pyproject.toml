@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "othello"
+version = "0.1.0"
+description = "A mecanistic exploration of OthelloGPT"
+authors = ["ddorn <diego.dorn@free.fr>"]
+license = "WTFPL"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+einops = "^0.6.1"
+tqdm = "^4.65.0"
+ipykernel = "^6.23.1"
+wandb = "^0.15.3"
+jupyter = "^1.0.0"
+jaxtyping = "^0.2.20"
+torchinfo = "^1.8.0"
+pytorch-lightning = "^2.0.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.3.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

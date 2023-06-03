@@ -16,15 +16,13 @@ import einops
 import wandb
 from ipywidgets import interact
 import plotly.express as px
-from ipywidgets import interact
 from pathlib import Path
 import itertools
 import random
 from IPython.display import display
 import wandb
-from jaxtyping import Float, Int, Bool, Shaped, jaxtyped
+from jaxtyping import Float, Int, Bool, jaxtyped
 from typing import Any, List, Literal, Union, Optional, Tuple, Callable, Dict
-import typeguard
 from functools import partial
 import copy
 import dataclasses
