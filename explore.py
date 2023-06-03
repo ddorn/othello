@@ -76,9 +76,7 @@ cfg = HookedTransformerConfig(
 )
 model = HookedTransformer(cfg)
 # %%
-sd = utils.download_file_from_hf(
-    "NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth"
-)
+sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth")
 # champion_ship_sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "championship_model.pth")
 model.load_state_dict(sd)
 
@@ -106,17 +104,17 @@ from mech_interp_othello_utils import (
 )
 
 # %%
-full_games_tokens: Int[Tensor, "games=100000 moves=60"] = t.tensor(
-    np.load(OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"), dtype=t.long
-)
+full_games_tokens: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
+    OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"),
+                                                                   dtype=t.long)
 """A tensor of shape `(num_games, length_of_game)` containing the board state at
 each move, as an integer from 0 to 60.  Suitable for input into the model.
 0 corresponds to 'pass' and is not used."""
 
 # Load board data as "strings" (i.e. 0 to 63 with middle squares skipped out)
-full_games_board_index: Int[Tensor, "games=100000 moves=60"] = t.tensor(
-    np.load(OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"), dtype=t.long
-)
+full_games_board_index: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
+    OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"),
+                                                                        dtype=t.long)
 """A tensor of shape `(num_games, length_of_game)` containing the board state at
 each move, as an integer from 0 to 63 with the middle squares skipped out.
 Suitable for ???."""
@@ -144,10 +142,9 @@ def to_board_label(i: int) -> str:
 board_labels = list(map(to_board_label, tokens_to_board))
 full_board_labels = list(map(to_board_label, range(64)))
 
+
 # %%
-def logits_to_board(
-    logits: Float[Tensor, "... 61"]
-) -> Float[Tensor, "... rows=8 cols=8"]:
+def logits_to_board(logits: Float[Tensor, "... 61"]) -> Float[Tensor, "... rows=8 cols=8"]:
     """Convert a set of logits into a board state, with each cell being a log prob of that cell being played."""
     log_probs = logits.log_softmax(-1)
     # Remove the "pass" move (the zeroth vocab item)
@@ -156,17 +153,15 @@ def logits_to_board(
 
     extra_shape = log_probs.shape[:-1]
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
-    temp_board_state = (
-        t.zeros((*extra_shape, 64), dtype=t.float32, device=device) - 13.0
-    )
+    temp_board_state = (t.zeros((*extra_shape, 64), dtype=t.float32, device=device) - 13.0)
     temp_board_state[..., tokens_to_board] = log_probs
     return temp_board_state.reshape(*extra_shape, 8, 8)
 
 
 # %%
-def plot_square_as_board(
-    state: Float[Tensor, "... rows=8 cols=8"], diverging_scale: bool = True, **kwargs
-):
+def plot_square_as_board(state: Float[Tensor, "... rows=8 cols=8"],
+                         diverging_scale: bool = True,
+                         **kwargs):
     """Takes a square input (8 by 8) and plot it as a board. Can do a stack of boards via facet_col=0"""
     kwargs = {
         "y": list("ABCDEFGH"),
@@ -189,7 +184,7 @@ focus_games_board_index = full_games_board_index[:num_games]
 # %%
 def one_hot(list_of_ints: List[int], num_classes=64):
     """Encode a list of ints into a one-hot vector of length `num_classes`"""
-    out = t.zeros((num_classes,), dtype=t.float32)
+    out = t.zeros((num_classes, ), dtype=t.float32)
     out[list_of_ints] = 1.0
     return out
 
@@ -242,8 +237,7 @@ if PROBE_STUFF:
     focus_logits.shape
 
     full_linear_probe: Float[Tensor, "mode=3 d_model rows=8 cols=8 options=3"] = t.load(
-        OTHELLO_MECHINT_ROOT / "main_linear_probe.pth", map_location=device
-    )
+        OTHELLO_MECHINT_ROOT / "main_linear_probe.pth", map_location=device)
 
     rows = 8
     cols = 8
@@ -258,18 +252,12 @@ if PROBE_STUFF:
 
     # Creating values for linear probe (converting the "black/white to play" notation into "me/them to play")
     linear_probe = t.zeros(cfg.d_model, rows, cols, options, device=device)
-    linear_probe[..., blank_index] = 0.5 * (
-        full_linear_probe[black_to_play_index, ..., 0]
-        + full_linear_probe[white_to_play_index, ..., 0]
-    )
-    linear_probe[..., their_index] = 0.5 * (
-        full_linear_probe[black_to_play_index, ..., 1]
-        + full_linear_probe[white_to_play_index, ..., 2]
-    )
-    linear_probe[..., my_index] = 0.5 * (
-        full_linear_probe[black_to_play_index, ..., 2]
-        + full_linear_probe[white_to_play_index, ..., 1]
-    )
+    linear_probe[..., blank_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 0] +
+                                            full_linear_probe[white_to_play_index, ..., 0])
+    linear_probe[..., their_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 1] +
+                                            full_linear_probe[white_to_play_index, ..., 2])
+    linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 2] +
+                                         full_linear_probe[white_to_play_index, ..., 1])
 
     layer = 6
     game_index = 9
@@ -298,7 +286,7 @@ if PROBE_STUFF:
         title="Example probe outputs after move 29 (black to play)",
     )
 
-    plot_single_board(int_to_label(focus_games_tokens[game_index, : move + 1]))
+    plot_single_board(int_to_label(focus_games_tokens[game_index, :move + 1]))
 
 
 # %%
@@ -331,11 +319,8 @@ def state_stack_to_one_hot(
 
 # %%
 
-
 # We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
-alternating = t.tensor(
-    [-1 if i % 2 == 0 else 1 for i in range(focus_games_tokens.shape[1])]
-)
+alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(focus_games_tokens.shape[1])])
 flipped_focus_states = focus_states * alternating[None, :, None, None]
 
 # We now convert to one-hot encoded vectors
@@ -356,18 +341,13 @@ if PROBE_STUFF:
     probe_out_value = probe_out.argmax(dim=-1)
     # %%
     correct_middle_odd_answers = (
-        probe_out_value.cpu() == focus_states_flipped_value[:, :-1]
-    )[:, 5:-5:2]
-    accuracies_odd = einops.reduce(
-        correct_middle_odd_answers.float(), "game move row col -> row col", "mean"
-    )
+        probe_out_value.cpu() == focus_states_flipped_value[:, :-1])[:, 5:-5:2]
+    accuracies_odd = einops.reduce(correct_middle_odd_answers.float(),
+                                   "game move row col -> row col", "mean")
 
-    correct_middle_answers = (probe_out_value == focus_states_flipped_value[:, :-1])[
-        :, 5:-5
-    ]
-    accuracies = einops.reduce(
-        correct_middle_answers.float(), "game move row col -> row col", "mean"
-    )
+    correct_middle_answers = (probe_out_value == focus_states_flipped_value[:, :-1])[:, 5:-5]
+    accuracies = einops.reduce(correct_middle_answers.float(), "game move row col -> row col",
+                               "mean")
 
     plot_square_as_board(
         1 - t.stack([accuracies_odd, accuracies], dim=0),
@@ -413,16 +393,12 @@ if PROBE_STUFF:
     imshow(
         cosine_similarities,
         title="Cosine Sim of B-W Linear Probe Directions by Cell",
-        x=[f"{L} (O)" for L in full_board_labels]
-        + [f"{L} (E)" for L in full_board_labels],
-        y=[f"{L} (O)" for L in full_board_labels]
-        + [f"{L} (E)" for L in full_board_labels],
+        x=[f"{L} (O)" for L in full_board_labels] + [f"{L} (E)" for L in full_board_labels],
+        y=[f"{L} (O)" for L in full_board_labels] + [f"{L} (E)" for L in full_board_labels],
     )
     # %%
-    blank_probe = (
-        linear_probe[..., blank_index]
-        - (linear_probe[..., my_index] + linear_probe[..., their_index]) / 2
-    )
+    blank_probe = (linear_probe[..., blank_index] -
+                   (linear_probe[..., my_index] + linear_probe[..., their_index]) / 2)
     my_probe = linear_probe[..., my_index] - linear_probe[..., their_index]
 
     # tests.test_my_probes(blank_probe, my_probe, linear_probe)
@@ -431,18 +407,16 @@ if PROBE_STUFF:
     game_index = 0
 
     # Plot board state
-    moves = focus_games_board_index[game_index, : pos + 1]
+    moves = focus_games_board_index[game_index, :pos + 1]
     plot_single_board(moves)
 
     # Plot corresponding model predictions
     state = t.zeros((8, 8), dtype=t.float32, device=device) - 13.0
-    state.flatten()[tokens_to_board] = focus_logits[game_index, pos].log_softmax(
-        dim=-1
-    )[1:]
+    state.flatten()[tokens_to_board] = focus_logits[game_index, pos].log_softmax(dim=-1)[1:]
     plot_square_as_board(state, zmax=0, diverging_scale=False, title="Log probs")
 
     # %%
-    moves = focus_games_board_index[game_index, : pos + 1]
+    moves = focus_games_board_index[game_index, :pos + 1]
     cell_r = 5
     cell_c = 4
     print(f"Flipping the color of cell {'ABCDEFGH'[cell_r]}{cell_c}")
@@ -455,9 +429,7 @@ if PROBE_STUFF:
     flipped_board.state[cell_r, cell_c] *= -1
     flipped_valid_moves = flipped_board.get_valid_moves()
 
-    newly_legal = [
-        string_to_label(move) for move in flipped_valid_moves if move not in valid_moves
-    ]
+    newly_legal = [string_to_label(move) for move in flipped_valid_moves if move not in valid_moves]
     newly_illegal = [
         string_to_label(move) for move in valid_moves if move not in flipped_valid_moves
     ]
@@ -498,13 +470,13 @@ if PROBE_STUFF:
         # Calculate the logits for the board state, with the `flip_hook` intervention
         # (note that we only need to use :pos+1 as input, because of causal attention)
         flipped_logits: Tensor = model.run_with_hooks(
-            focus_games_tokens[game_index : game_index + 1, : pos + 1],
+            focus_games_tokens[game_index:game_index + 1, :pos + 1],
             fwd_hooks=[
                 (utils.get_act_name("resid_post", layer), flip_hook),
             ],
         ).log_softmax(dim=-1)[0, pos]
 
-        flip_state = t.zeros((64,), dtype=t.float32, device=device) - 10.0
+        flip_state = t.zeros((64, ), dtype=t.float32, device=device) - 10.0
         flip_state[tokens_to_board] = flipped_logits.log_softmax(dim=-1)[1:]
         big_flipped_states_list.append(flip_state)
 
@@ -535,7 +507,7 @@ if PROBE_STUFF:
     move = 20
     layer = 6
 
-    plot_single_board(focus_games_board_index[game_index, : move + 1])
+    plot_single_board(focus_games_board_index[game_index, :move + 1])
     plot_probe_outputs(layer, game_index, move)
 
     # %%
@@ -559,33 +531,21 @@ if PROBE_STUFF:
         move: int,
     ) -> Tuple[Float[Tensor, "layers rows cols"], Float[Tensor, "layers rows cols"]]:
         attn = t.stack(
-            [
-                focus_cache["attn_out", layr][game_index, move]
-                for layr in range(layer + 1)
-            ]
-        )
-        mlp = t.stack(
-            [
-                focus_cache["mlp_out", layr][game_index, move]
-                for layr in range(layer + 1)
-            ]
-        )
+            [focus_cache["attn_out", layr][game_index, move] for layr in range(layer + 1)])
+        mlp = t.stack([focus_cache["mlp_out", layr][game_index, move] for layr in range(layer + 1)])
 
-        attn_contributions = einops.einsum(
-            attn, my_probe, "layers d_model, d_model rows cols -> layers rows cols"
-        )
-        mlp_contributions = einops.einsum(
-            mlp, my_probe, "layers d_model, d_model rows cols -> layers rows cols"
-        )
+        attn_contributions = einops.einsum(attn, my_probe,
+                                           "layers d_model, d_model rows cols -> layers rows cols")
+        mlp_contributions = einops.einsum(mlp, my_probe,
+                                          "layers d_model, d_model rows cols -> layers rows cols")
 
         return attn_contributions, mlp_contributions
 
     (
         attn_contributions,
         mlp_contributions,
-    ) = calculate_attn_and_mlp_probe_score_contributions(
-        focus_cache, my_probe, layer, game_index, move
-    )
+    ) = calculate_attn_and_mlp_probe_score_contributions(focus_cache, my_probe, layer, game_index,
+                                                         move)
 
     plot_contributions(attn_contributions, "Attention")
     plot_contributions(mlp_contributions, "MLP")
@@ -604,32 +564,31 @@ if PROBE_STUFF:
             "d_model, d_model rows cols -> rows cols",
         )
 
-    overall_contribution = calculate_accumulated_probe_score(
-        focus_cache, my_probe, layer, game_index, move
-    )
+    overall_contribution = calculate_accumulated_probe_score(focus_cache, my_probe, layer,
+                                                             game_index, move)
 
     imshow(
         overall_contribution,
-        title=f"Overall Probe Score after Layer {layer} for<br>my vs their (Game {game_index} Move {move})",
+        title=
+        f"Overall Probe Score after Layer {layer} for<br>my vs their (Game {game_index} Move {move})",
     )
     # %%
     (
         attn_contributions,
         mlp_contributions,
-    ) = calculate_attn_and_mlp_probe_score_contributions(
-        focus_cache, blank_probe, layer, game_index, move
-    )
+    ) = calculate_attn_and_mlp_probe_score_contributions(focus_cache, blank_probe, layer,
+                                                         game_index, move)
 
     plot_contributions(attn_contributions, "Attention")
     plot_contributions(mlp_contributions, "MLP")
 
-    overall_contribution = calculate_accumulated_probe_score(
-        focus_cache, blank_probe, layer, game_index, move
-    )
+    overall_contribution = calculate_accumulated_probe_score(focus_cache, blank_probe, layer,
+                                                             game_index, move)
 
     imshow(
         overall_contribution,
-        title=f"Overall Probe Score after Layer {layer} for<br>my vs their (Game {game_index} Move {move})",
+        title=
+        f"Overall Probe Score after Layer {layer} for<br>my vs their (Game {game_index} Move {move})",
     )
     # %%
     # Scale the probes down to be unit norm per cell
@@ -707,12 +666,9 @@ if PROBE_STUFF:
     layer = 5
     neuron = 1427
 
-    w_in_L5N1393_blank = calculate_neuron_input_weights(
-        model, blank_probe_normalised, layer, neuron
-    )
-    w_in_L5N1393_my = calculate_neuron_input_weights(
-        model, my_probe_normalised, layer, neuron
-    )
+    w_in_L5N1393_blank = calculate_neuron_input_weights(model, blank_probe_normalised, layer,
+                                                        neuron)
+    w_in_L5N1393_my = calculate_neuron_input_weights(model, my_probe_normalised, layer, neuron)
 
     imshow(
         t.stack([w_in_L5N1393_blank, w_in_L5N1393_my]),
@@ -728,21 +684,21 @@ if PROBE_STUFF:
 
     U, S, Vh = t.svd(
         t.cat(
-            [my_probe.reshape(cfg.d_model, 64), blank_probe.reshape(cfg.d_model, 64)],
+            [my_probe.reshape(cfg.d_model, 64),
+             blank_probe.reshape(cfg.d_model, 64)],
             dim=1,
-        )
-    )
+        ))
 
     # Remove the final four dimensions of U, as the 4 center cells are never blank and so the blank probe is meaningless there
     probe_space_basis = U[:, :-4]
 
     print(
         "Fraction of input weights in probe basis:",
-        (w_in_L5N1393 @ probe_space_basis).norm().item() ** 2,
+        (w_in_L5N1393 @ probe_space_basis).norm().item()**2,
     )
     print(
         "Fraction of output weights in probe basis:",
-        (w_out_L5N1393 @ probe_space_basis).norm().item() ** 2,
+        (w_out_L5N1393 @ probe_space_basis).norm().item()**2,
     )
 
     # %%
@@ -750,13 +706,9 @@ if PROBE_STUFF:
         """
         Computes the kurtosis of a tensor over specified dimensions.
         """
-        return (
-            (
-                (x - x.mean(dim=reduced_axes, keepdim=True))
-                / x.std(dim=reduced_axes, keepdim=True)
-            )
-            ** 4
-        ).mean(dim=reduced_axes, keepdim=False) - fisher * 3
+        return ((
+            (x - x.mean(dim=reduced_axes, keepdim=True)) / x.std(dim=reduced_axes, keepdim=True))**
+                4).mean(dim=reduced_axes, keepdim=False) - fisher * 3
 
     # %%
     layer = 4
@@ -774,19 +726,16 @@ if PROBE_STUFF:
     for neuron in top_layer_neurons:
         neuron = neuron.item()
         heatmaps_blank.append(
-            calculate_neuron_output_weights(
-                model, blank_probe_normalised, layer, neuron
-            )
-        )
+            calculate_neuron_output_weights(model, blank_probe_normalised, layer, neuron))
         heatmaps_my.append(
-            calculate_neuron_output_weights(model, my_probe_normalised, layer, neuron)
-        )
+            calculate_neuron_output_weights(model, my_probe_normalised, layer, neuron))
 
     imshow(
         t.stack(heatmaps_blank),
         facet_col=0,
         y=[i for i in "ABCDEFGH"],
-        title=f"Cosine sim of Output weights and the 'blank color' probe for top layer {layer} neurons",
+        title=
+        f"Cosine sim of Output weights and the 'blank color' probe for top layer {layer} neurons",
         facet_labels=[f"L{layer}N{n.item()}" for n in top_layer_neurons],
         width=1600,
         height=300,
@@ -807,7 +756,7 @@ if PROBE_STUFF:
     move = 20
 
     plot_single_board(
-        focus_games_board_index[game_index, : move + 1],
+        focus_games_board_index[game_index, :move + 1],
         title="Original Game (black plays E0)",
     )
     plot_single_board(
@@ -815,8 +764,8 @@ if PROBE_STUFF:
         title="Corrupted Game (blank plays C0)",
     )
     # %%
-    clean_input = focus_games_tokens[game_index, : move + 1].clone()
-    corrupted_input = focus_games_tokens[game_index, : move + 1].clone()
+    clean_input = focus_games_tokens[game_index, :move + 1].clone()
+    corrupted_input = focus_games_tokens[game_index, :move + 1].clone()
     corrupted_input[-1] = to_int("C0")
     print("Clean:     ", ", ".join(int_to_label(corrupted_input)))
     print("Corrupted: ", ", ".join(int_to_label(clean_input)))
@@ -867,9 +816,7 @@ if PROBE_STUFF:
         model: HookedTransformer,
         corrupted_input: Float[Tensor, "batch pos"],
         clean_cache: ActivationCache,
-        patching_metric: Callable[
-            [Float[Tensor, "batch seq d_model"]], Float[Tensor, ""]
-        ],
+        patching_metric: Callable[[Float[Tensor, "batch seq d_model"]], Float[Tensor, ""]],
     ) -> Float[Tensor, "2 n_layers"]:
         """
         Returns an array of results, corresponding to the results of patching at
@@ -897,9 +844,7 @@ if PROBE_STUFF:
         return out
 
     # %%
-    patching_results = get_act_patch_resid_pre(
-        model, corrupted_input, clean_cache, patching_metric
-    )
+    patching_results = get_act_patch_resid_pre(model, corrupted_input, clean_cache, patching_metric)
     line(
         patching_results,
         title="Layer Output Patching Effect on F0 Log Prob",
@@ -926,9 +871,8 @@ if PROBE_STUFF:
         pos_start: int = 5
         pos_end: int = model.cfg.n_ctx - 5
         length: int = pos_end - pos_start
-        alternating: Tensor = t.tensor(
-            [1 if i % 2 == 0 else -1 for i in range(length)], device=device
-        )
+        alternating: Tensor = t.tensor([1 if i % 2 == 0 else -1 for i in range(length)],
+                                       device=device)
 
         # Game state (options are blank/mine/theirs)
         options: int = 3
@@ -975,36 +919,28 @@ if PROBE_STUFF:
         return states
 
     class LitLinearProbe(pl.LightningModule):
+
         def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs):
             super().__init__()
             self.model = model
             self.args = args
             self.linear_probe: Float[
-                Tensor, "mode d_model rows cols options"
-            ] = args.setup_linear_probe(model)
+                Tensor, "mode d_model rows cols options"] = args.setup_linear_probe(model)
             pl.seed_everything(42, workers=True)
 
-        def training_step(
-            self, batch: Int[Tensor, "game_idx"], batch_idx: int
-        ) -> t.Tensor:
+        def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
             games_int = full_games_tokens[batch.cpu()]
             games_str = full_games_board_index[batch.cpu()]
             state_stack = t.stack(
-                [
-                    t.tensor(seq_to_state_stack(game_str.tolist()))
-                    for game_str in games_str
-                ]
-            )
-            state_stack = state_stack[:, self.args.pos_start : self.args.pos_end, :, :]
+                [t.tensor(seq_to_state_stack(game_str.tolist())) for game_str in games_str])
+            state_stack = state_stack[:, self.args.pos_start:self.args.pos_end, :, :]
             state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
             batch_size = self.args.batch_size
             game_len = self.args.length
 
             # games_int = tensor of game sequences, each of length 60
             # This is the input to our model
-            assert isinstance(
-                games_int, Int[Tensor, f"batch={batch_size} full_game_len=60"]
-            )
+            assert isinstance(games_int, Int[Tensor, f"batch={batch_size} full_game_len=60"])
 
             # state_stack_one_hot = tensor of one-hot encoded states for each game
             # We'll multiply this by our probe's estimated log probs along the `options` dimension, to get probe's estimated log probs for the correct option
@@ -1022,9 +958,9 @@ if PROBE_STUFF:
                 games_int[:, :-1],
                 names_filter=lambda name: name == act_name,
             )
-            resid_post: Float[Tensor, "batch moves d_model"] = cache[act_name][
-                :, self.args.pos_start : self.args.pos_end
-            ]
+            resid_post: Float[
+                Tensor,
+                "batch moves d_model"] = cache[act_name][:, self.args.pos_start:self.args.pos_end]
 
             probe_logits = einops.einsum(
                 self.linear_probe,
@@ -1049,9 +985,7 @@ if PROBE_STUFF:
             """
             Returns `games_int` and `state_stack_one_hot` tensors.
             """
-            n_indices = self.args.num_games - (
-                self.args.num_games % self.args.batch_size
-            )
+            n_indices = self.args.num_games - (self.args.num_games % self.args.batch_size)
             full_train_indices = t.randperm(self.args.num_games)[:n_indices]
             full_train_indices = einops.rearrange(
                 full_train_indices,
@@ -1097,18 +1031,12 @@ if PROBE_STUFF:
 
     # Creating values for linear probe (converting the "black/white to play" notation into "me/them to play")
     my_linear_probe = t.zeros(cfg.d_model, rows, cols, options, device=device)
-    my_linear_probe[..., blank_index] = 0.5 * (
-        litmodel.linear_probe[black_to_play_index, ..., 0]
-        + litmodel.linear_probe[white_to_play_index, ..., 0]
-    )
-    my_linear_probe[..., their_index] = 0.5 * (
-        litmodel.linear_probe[black_to_play_index, ..., 1]
-        + litmodel.linear_probe[white_to_play_index, ..., 2]
-    )
-    my_linear_probe[..., my_index] = 0.5 * (
-        litmodel.linear_probe[black_to_play_index, ..., 2]
-        + litmodel.linear_probe[white_to_play_index, ..., 1]
-    )
+    my_linear_probe[..., blank_index] = 0.5 * (litmodel.linear_probe[black_to_play_index, ..., 0] +
+                                               litmodel.linear_probe[white_to_play_index, ..., 0])
+    my_linear_probe[..., their_index] = 0.5 * (litmodel.linear_probe[black_to_play_index, ..., 1] +
+                                               litmodel.linear_probe[white_to_play_index, ..., 2])
+    my_linear_probe[..., my_index] = 0.5 * (litmodel.linear_probe[black_to_play_index, ..., 2] +
+                                            litmodel.linear_probe[white_to_play_index, ..., 1])
 
     # Getting the probe's output, and then its predictions
     probe_out = einops.einsum(
@@ -1119,20 +1047,14 @@ if PROBE_STUFF:
     probe_out_value = probe_out.argmax(dim=-1)
 
     # Getting the correct answers in the odd cases
-    correct_middle_odd_answers = (
-        probe_out_value == focus_states_flipped_value[:, :-1]
-    )[:, 5:-5:2]
-    accuracies_odd = einops.reduce(
-        correct_middle_odd_answers.float(), "game move row col -> row col", "mean"
-    )
+    correct_middle_odd_answers = (probe_out_value == focus_states_flipped_value[:, :-1])[:, 5:-5:2]
+    accuracies_odd = einops.reduce(correct_middle_odd_answers.float(),
+                                   "game move row col -> row col", "mean")
 
     # Getting the correct answers in all cases
-    correct_middle_answers = (probe_out_value == focus_states_flipped_value[:, :-1])[
-        :, 5:-5
-    ]
-    accuracies = einops.reduce(
-        correct_middle_answers.float(), "game move row col -> row col", "mean"
-    )
+    correct_middle_answers = (probe_out_value == focus_states_flipped_value[:, :-1])[:, 5:-5]
+    accuracies = einops.reduce(correct_middle_answers.float(), "game move row col -> row col",
+                               "mean")
 
     plot_square_as_board(
         1 - t.stack([accuracies_odd, accuracies], dim=0),
@@ -1198,9 +1120,8 @@ loss, accuracy = get_loss(model, focus_games_tokens, focus_games_board_index)
 # %%
 # Now, we find the loss but after ablating each head
 
-def zero_ablation_hook(
-    activation: Tensor, hook: HookPoint, head: Optional[int] = None
-):
+
+def zero_ablation_hook(activation: Tensor, hook: HookPoint, head: Optional[int] = None):
     if head is not None:
         assert activation.shape[2] == model.cfg.n_heads
         activation[:, :, head] = 0
@@ -1213,7 +1134,7 @@ def zero_ablation(
     metrics: Callable[[HookedTransformer], Union[float, Float[Tensor, "n_metrics"]]],
     individual_heads: bool = False,
     substract_base: bool = False,
-) -> Float[Tensor, 'n_metrics n_layers n_components']:
+) -> Float[Tensor, "n_metrics n_layers n_components"]:
     """
     Compute the given metrics after ablating each multihead and MLP of the model.
     If `individual_heads` is True, then we ablate each head individually.
@@ -1257,15 +1178,16 @@ def zero_ablation(
 
     return record
 
-#%%
+
+# %%
 individual_heads = True
 get_metrics = lambda model: get_loss(model, focus_games_tokens, focus_games_board_index, 0, -1)
 metrics = zero_ablation(model, get_metrics, individual_heads)
-#%%
+# %%
 base_metrics = get_metrics(model)
 # %%
 # Plotting the results
-x = [f"Head {i}" for i in range(model.cfg.n_heads)] + [ "MLP"]
+x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["MLP"]
 y = [f"Layer {i}" for i in range(model.cfg.n_layers)]
 if not individual_heads:
     x = x[-2:]
@@ -1287,8 +1209,9 @@ imshow(
 
 # Abblate all attention after the first layer
 for start_layer in range(model.cfg.n_layers):
+
     def filter(name: str):
-        if not name.startswith('blocks.'):
+        if not name.startswith("blocks."):
             # 'hook_embed' or 'hook_pos_embed' or 'ln_final.hook_scale' or 'ln_final.hook_normalized'
             return False
 
