@@ -45,10 +45,28 @@ from rich import print as rprint
 import pandas as pd
 from plotly_utils import imshow
 from neel_plotly import scatter, line
+# %%
 
-device = "cuda" if t.cuda.is_available() else "cpu"
+OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
+OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
 
+if not OTHELLO_ROOT.exists():
+    os.system("git clone https://github.com/likenneth/othello_world")
+
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
+    plot_board,
+    plot_single_board,
+    plot_board_log_probs,
+    to_string,
+    to_int,
+    int_to_label,
+    string_to_label,
+    OthelloBoardState,
+)
+
+# %%
 t.set_grad_enabled(False)
+device = "cuda" if t.cuda.is_available() else "cpu"
 
 # %%
 
@@ -70,26 +88,6 @@ sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "synt
 # champion_ship_sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "championship_model.pth")
 model.load_state_dict(sd)
 
-# %%
-
-OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
-OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
-
-if not OTHELLO_ROOT.exists():
-    os.system("git clone https://github.com/likenneth/othello_world")
-    os.
-
-# %%
-from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
-    plot_board,
-    plot_single_board,
-    plot_board_log_probs,
-    to_string,
-    to_int,
-    int_to_label,
-    string_to_label,
-    OthelloBoardState,
-)
 
 # %%
 full_games_tokens: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
@@ -207,14 +205,15 @@ print("focus states:", focus_states.shape)
 print("focus_valid_moves", focus_valid_moves.shape)
 
 # %%
-imshow(
-    focus_states[0, :16],
-    facet_col=0,
-    facet_col_wrap=8,
-    facet_labels=[f"Move {i}" for i in range(1, 17)],
-    title="First 16 moves of first game",
-    color_continuous_scale="Greys",
-)
+if False:
+    imshow(
+        focus_states[0, :16],
+        facet_col=0,
+        facet_col_wrap=8,
+        facet_labels=[f"Move {i}" for i in range(1, 17)],
+        title="First 16 moves of first game",
+        color_continuous_scale="Greys",
+    )
 
 # %%
 def state_stack_to_one_hot(
@@ -262,6 +261,7 @@ focus_states_flipped_value = focus_states_flipped_one_hot.argmax(dim=-1).to(devi
 # First, we evalute the loss only on the focus games
 
 
+@t.inference_mode()
 def get_loss(
     model: HookedTransformer,
     games_token: Int[Tensor, "batch game_len rows cols"],
@@ -320,6 +320,7 @@ def zero_ablation_hook(activation: Tensor, hook: HookPoint, head: Optional[int] 
         activation.fill_(0)
 
 
+@t.inference_mode()
 def zero_ablation(
     model: HookedTransformer,
     metrics: Callable[[HookedTransformer], Union[float, Float[Tensor, "n_metrics"]]],
@@ -378,23 +379,24 @@ metrics = zero_ablation(model, get_metrics, individual_heads)
 base_metrics = get_metrics(model)
 # %%
 # Plotting the results
-x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["MLP"]
+x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["All Heads", "MLP"]
 y = [f"Layer {i}" for i in range(model.cfg.n_layers)]
 if not individual_heads:
     x = x[-2:]
 
-imshow(
+fig_1 = imshow(
     metrics[0] - base_metrics[0],
     title="Loss after zeroing each component",
     x=x,
     y=y,
 )
+fig_1.write_image("loss_ablation_each_component.svg")
 imshow(
     metrics[1] - base_metrics[1],
     title="Accuracy after zeroing each component",
     x=x,
     y=y,
-)
+).write_image("accuracy_ablation_each_component.svg")
 
 # %% Are Attention heads even useful?
 
