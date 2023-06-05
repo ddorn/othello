@@ -581,7 +581,7 @@ class ProbeTrainingArgs:
     pos_start: int = 5
     pos_end: int = model.cfg.n_ctx - 5
     length: int = pos_end - pos_start
-    alternating: Tensor = t.tensor([1 if i % 2 == 0 else -1 for i in range(length)], device=device)
+    alternating: Tensor = t.tensor([1 if i % 2 == 0 else -1 for i in range(length)])
 
     # Game state (options are blank/mine/theirs)
     options: int = 3
@@ -608,9 +608,13 @@ class ProbeTrainingArgs:
             self.rows,
             self.cols,
             self.options,
-            requires_grad=True,
+            requires_grad=False,
             device=device,
         ) / np.sqrt(model.cfg.d_model)
+        # We want to pass this tensor to the optimizer, so it needs to be a leaf,
+        # and not be a computation of other tensors (here divison by sqrt(d_model))
+        # Thus, we can't use the `requires_grad` argument of `t.randn`.
+        linear_probe.requires_grad = True
         return linear_probe
 
 
@@ -636,12 +640,14 @@ class LitLinearProbe(pl.LightningModule):
         pl.seed_everything(42, workers=True)
 
     def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
+        focus_moves = slice(self.args.pos_start, self.args.pos_end)
+
         games_token = full_games_tokens[batch.cpu()]
         games_board_index = full_games_board_index[batch.cpu()]
         state_stack = move_sequence_to_state(games_board_index)
+        state_stack = state_stack[:, focus_moves]
         state_stack = einops.einsum(state_stack, self.args.alternating,
                                     "batch move row col, move -> batch move row col")
-        state_stack = state_stack[:, self.args.pos_start:self.args.pos_end]
         state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
         batch_size = self.args.batch_size
         game_len = self.args.length
@@ -669,7 +675,7 @@ class LitLinearProbe(pl.LightningModule):
             )
 
         resid_post: Float[Tensor, "batch moves d_model"]
-        resid_post = cache[act_name][:, self.args.pos_start:self.args.pos_end]
+        resid_post = cache[act_name][:, focus_moves]
 
         probe_logits = einops.einsum(
             self.linear_probe,
@@ -683,7 +689,7 @@ class LitLinearProbe(pl.LightningModule):
 
         loss = -probe_loss.mean(0).sum()  # avg over moves, sum over the board
 
-        self.log("train_loss", -loss)
+        self.log("train_loss", loss)
         return loss
 
     def train_dataloader(self):
