@@ -823,4 +823,18 @@ plot_similarities_2(litmodel.linear_probe[..., 1], my_probe,
 plot_similarities_2(litmodel.linear_probe[..., 2], their_probe,
                     "New and old their probe")
 
+# %% Training an orthogonal probe
+args = ProbeTrainingArgs(probe_name='orthogonal_probe')
+lit_ortho_probe = LitLinearProbe(model, args, litmodel.linear_probe)
+
+logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
+
+# Train the model
+trainer = pl.Trainer(
+    max_epochs=args.max_epochs,
+    logger=logger,
+    log_every_n_steps=1,
+)
+trainer.fit(model=lit_ortho_probe)
 # %%
+wandb.finish()
