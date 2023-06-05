@@ -12,6 +12,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from circuitsvis.attention import attention_patterns
 import einops
 import numpy as np
 import plotly.express as px
@@ -358,6 +361,18 @@ def zero_ablation(
 
 
 # %%
+SHOW_ATTENTION = False
+if SHOW_ATTENTION:
+    _, focus_cache = model.run_with_cache(focus_games_tokens[:, :-1])
+
+# %%
+if SHOW_ATTENTION:
+    game_idx = 0
+    layer = 0
+    labels = [to_board_label(focus_games_board_index[game_idx, i]) for i in range(59)]
+    attention_patterns(labels, focus_cache['pattern', layer][game_idx])
+
+# %%
 RUN_ABLATIONS = False
 
 if RUN_ABLATIONS:
@@ -440,6 +455,10 @@ linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ...,
 blank_probe = linear_probe[..., blank_index]
 their_probe = linear_probe[..., their_index]
 my_probe = linear_probe[..., my_index]
+
+blank_direction = blank_probe - (their_probe + my_probe) / 2
+my_direction = my_probe - their_probe
+
 # %%
 
 
@@ -456,13 +475,21 @@ for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", 
                       x=full_board_labels,
                       y=full_board_labels)
 
+
 # %% Similarity between mine and theirs (for each square)
-sim = einops.einsum(
-    my_probe / t.norm(my_probe, dim=0),
-    their_probe / t.norm(their_probe, dim=0),
-    "d_model rows cols, d_model rows cols -> rows cols",
-)
-plot_square_as_board(sim, title="Cosine similarity between mine and their vectors of the probe")
+def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
+                        v2: Float[Tensor, '*n_vectors rows cols'], **kwargs):
+    v1 = v1.flatten(end_dim=-3)
+    v2 = v2.flatten(end_dim=-3)
+    sim = einops.einsum(
+        v1, # / t.norm(v1, dim=0),
+        v2, # / t.norm(v2, dim=0),
+        "d_model rows cols, d_model rows cols -> rows cols",
+    )
+    plot_square_as_board(sim, title="Cosine similarity between mine and their vectors of the probe")
+
+
+plot_similarities_2(my_probe, their_probe)
 
 # %% UMAP on the vectors of the probe
 import umap
@@ -481,4 +508,65 @@ hover_data = pd.DataFrame({
 
 umap.plot.show_interactive(
     umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
+
+
+# %%
+def plot_PCA(vectors: Float[Tensor, '*n_vectors dim'], name: str = ""):
+    vectors = vectors.flatten(end_dim=-2)
+    vectors = StandardScaler().fit_transform(vectors.cpu().numpy())
+    pca = PCA()
+    pca.fit(vectors)
+    # return px.bar(
+    #     x=range(1, len(pca.explained_variance_) + 1),
+    #     y=pca.explained_variance_,
+    #     title=f"PCA explained variance for {name}",
+    #     labels={"x": "Component", "y": "Log explained variance"},
+    # )
+    display(
+        px.bar(x=range(len(pca.explained_variance_ratio_)),
+               y=pca.explained_variance_ratio_,
+               title=f"Explained variance ratio of the PCA on {name}"))
+
+    return pca
+
+
+# %% Run PCA on the vectors of the probe
+vectors = einops.rearrange(linear_probe, "d_model rows cols options -> (options rows cols) d_model")
+plot_PCA(vectors, "the probe vectors")
+
+# %% Same PCA but with the unembeddings
+plot_PCA(model.W_U, "the unembeddings")
+
+# %%
+plot_PCA(model.W_pos, "the embeddings")
+# %%
+all_vectors = [
+    model.W_U.T,
+    model.W_E,
+    model.W_pos,
+    vectors,
+]
+all_vectors = [(v - v.mean(dim=0)) / v.std(dim=0) for v in all_vectors]
+
+plot_PCA(t.cat(all_vectors, dim=0), "the embeddings and unembeddings")
+# %%
+plot_PCA(t.cat([my_direction, blank_direction], dim=1).flatten(1).T, "the direction vectors")
+# %%
+plot_PCA(my_direction.flatten(1).T, "the direction vectors")
+# %%
+plot_PCA(blank_direction.flatten(1).T, "the direction vectors")
+# %%
+
+dim = 512
+n_vectors = 1000
+vectors = t.randn(n_vectors, dim)
+vectors = vectors / t.norm(vectors, dim=1, keepdim=True)
+cosine_sim = einops.einsum(vectors, vectors, "vec_1 dim, vec_2 dim -> vec_1 vec_2")
+
+print(f"Mean cosine similarity: {cosine_sim.mean():.3f}")
+print(f"Std cosine similarity: {cosine_sim.std():.3f}")
+print(f"Mean abs cosine similarity: {cosine_sim.abs().mean():.3f}")
+
+# %% plot histogram of cosine similarities
+px.histogram(cosine_sim.flatten(), title="Cosine similarity between random vectors")
 # %%
