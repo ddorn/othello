@@ -732,9 +732,64 @@ trainer = pl.Trainer(
 trainer.fit(model=litmodel)
 # %%
 wandb.finish()
+
+# %% Compute the accuracy of the probe
+
+
+def probe_accuracy(
+    probe: Float[Tensor, "d_model rows cols options"],
+    game_tokens: Int[Tensor, "batch game_len"],
+    game_board_index: Int[Tensor, "batch game_len"],
+    pos_start: int = 5,
+    pos_end: int = -5,
+    layer: int = 6,
+) -> Float[Tensor, "batch"]:
+    # We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
+
+    flipped_focus_states = focus_states * alternating[None, :, None, None]
+
+    # We now convert to one-hot encoded vectors
+    focus_states_flipped_one_hot = state_stack_to_one_hot(t.tensor(flipped_focus_states))
+
+    # Take the argmax (i.e. the index of option empty/their/mine)
+    focus_states_flipped_value = focus_states_flipped_one_hot.argmax(dim=-1)
+
+    focus_moves = slice(pos_start, args.pos_end)
+    alternating = np.array([-1 if i % 2 == 0 else 1 for i in range(60)])
+
+    state_stack = move_sequence_to_state(game_board_index)
+    state_stack = state_stack[:, focus_moves]
+    state_stack = einops.einsum(state_stack, alternating[focus_moves],
+                                "batch move row col, move -> batch move row col")
+    state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
+
+    act_name = utils.get_act_name("resid_post", layer)
+    with t.inference_mode():
+        _, cache = model.run_with_cache(
+            game_tokens[:, :-1],  # Not the last move
+            names_filter=lambda name: name == act_name,
+        )
+
+    probe_out = einops.einsum(
+        cache["resid_post", layer], probe,
+        "game move d_model, d_model row col options -> game move row col options")
+
+    probe_out_value = probe_out.argmax(dim=-1)
+
+    correct_answers = (probe_out_value.cpu() == focus_states_flipped_value[:, :-1])[:, focus_moves]
+    accuracy = einops.reduce(correct_answers.float(), "game move row col -> row col", "mean")
+
+    plot_square_as_board(
+        1 - accuracy,
+        title="Average Error Rate of Linear Probe",
+        facet_col=0, facet_labels=["Black to Play moves", "All Moves"],
+        zmax=0.25, zmin=-0.25
+    )
+
 # %%
-black_to_play_index = 0
-white_to_play_index = 1
-blank_index = 0
-their_index = 1
-my_index = 2
+probe_accuracy(
+    litmodel.linear_probe,
+    full_games_tokens[-50:],
+    full_board_labels[-50:],
+)
+# %%
