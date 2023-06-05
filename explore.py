@@ -694,6 +694,7 @@ class LitLinearProbe(pl.LightningModule):
             "mean") * self.args.options  # Multiply to correct for the mean over options
 
         loss = -probe_loss.mean(0).sum()  # avg over moves, sum over the board
+        self.log("train_loss", loss)
 
         if self.old_probe is not None:
             penalisation = einops.einsum(
@@ -703,8 +704,6 @@ class LitLinearProbe(pl.LightningModule):
             ) ** 2 * self.args.penalty_weight
             self.log("penalisation", penalisation)
             return loss + penalisation
-
-        self.log("train_loss", loss)
         return loss
 
     def train_dataloader(self):
