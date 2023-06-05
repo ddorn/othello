@@ -600,7 +600,7 @@ class ProbeTrainingArgs:
     wd: float = 0.01
 
     # Othognal regularization (to an other probe)
-    penalty_weight: float = 1000.0
+    penalty_weight: float = 10000.0
 
     # Misc.
     probe_name: str = "main_linear_probe"
@@ -636,10 +636,11 @@ class LitLinearProbe(pl.LightningModule):
 
     def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs, old_probe: Optional[Float[Tensor, "d_model rows cols options"]] = None):
         super().__init__()
+        for name, _ in self.named_parameters():
+            print(name)
         self.model = model
         self.args = args
-        self.linear_probe: Float[Tensor,
-                                 "d_model rows cols options"] = args.setup_linear_probe(model)
+        self.linear_probe = nn.Parameter(args.setup_linear_probe(model))
         """shape: (d_model, rows, cols, options)"""
         self.old_probe = old_probe
 
@@ -700,8 +701,9 @@ class LitLinearProbe(pl.LightningModule):
             penalisation = einops.einsum(
                 self.old_probe / t.norm(self.old_probe, dim=0),
                 self.linear_probe / t.norm(self.linear_probe, dim=0),
-                "d_model row col option, d_model row col option ->",
-            ) ** 2 * self.args.penalty_weight
+                "d_model row col option, d_model row col option -> row col option",
+            ) ** 2
+            penalisation = penalisation.mean() * self.args.penalty_weight
             self.log("penalisation", penalisation)
             return loss + penalisation
         return loss
@@ -730,22 +732,31 @@ class LitLinearProbe(pl.LightningModule):
 
 # %%
 # Create the model & training system
-args = ProbeTrainingArgs()
-litmodel = LitLinearProbe(model, args)
+TRAIN_FIRST_PROBE = True
+if TRAIN_FIRST_PROBE:
+    args = ProbeTrainingArgs()
+    litmodel = LitLinearProbe(model, args)
 
-# You can choose either logger
-# logger = CSVLogger(save_dir=os.getcwd() + "/logs", name=args.probe_name)
-logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
+    # You can choose either logger
+    # logger = CSVLogger(save_dir=os.getcwd() + "/logs", name=args.probe_name)
+    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
 
-# Train the model
-trainer = pl.Trainer(
-    max_epochs=args.max_epochs,
-    logger=logger,
-    log_every_n_steps=1,
-)
-trainer.fit(model=litmodel)
-# %%
-wandb.finish()
+    # Train the model
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        logger=logger,
+        log_every_n_steps=1,
+    )
+    trainer.fit(model=litmodel)
+    wandb.finish()
+else:
+    checkpoint_path = "logs/main_linear_probe/zq4ze0zt/checkpoints/epoch=7-step=1560.ckpt"
+    litmodel = LitLinearProbe.load_from_checkpoint(
+        checkpoint_path,
+        model=model,
+        args=ProbeTrainingArgs(),
+    )
+
 
 # %% Compute the accuracy of the probe
 
@@ -759,7 +770,7 @@ def probe_accuracy(
     pos_start: int = 5,
     pos_end: int = -5,
     layer: int = 6,
-) -> Float[Tensor, "batch"]:
+) -> None:
     # We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
 
     alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(60)])
@@ -800,7 +811,7 @@ def probe_accuracy(
 
     print(accuracy.shape)
     plot_square_as_board(
-        1 - accuracy,
+        accuracy,
         title="Accuracy Rate of Linear Probe",
     )
 
