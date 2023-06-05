@@ -599,6 +599,9 @@ class ProbeTrainingArgs:
     betas: Tuple[float, float] = (0.9, 0.99)
     wd: float = 0.01
 
+    # Othognal regularization (to an other probe)
+    penalty_weight: float = 1000.0
+
     # Misc.
     probe_name: str = "main_linear_probe"
 
@@ -631,13 +634,15 @@ class ProbeTrainingArgs:
 
 class LitLinearProbe(pl.LightningModule):
 
-    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs):
+    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs, old_probe: Optional[Float[Tensor, "d_model rows cols options"]] = None):
         super().__init__()
         self.model = model
         self.args = args
         self.linear_probe: Float[Tensor,
                                  "d_model rows cols options"] = args.setup_linear_probe(model)
         """shape: (d_model, rows, cols, options)"""
+        self.old_probe = old_probe
+
         pl.seed_everything(42, workers=True)
 
     def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
@@ -689,6 +694,15 @@ class LitLinearProbe(pl.LightningModule):
             "mean") * self.args.options  # Multiply to correct for the mean over options
 
         loss = -probe_loss.mean(0).sum()  # avg over moves, sum over the board
+
+        if self.old_probe is not None:
+            penalisation = einops.einsum(
+                self.old_probe / t.norm(self.old_probe, dim=0),
+                self.linear_probe / t.norm(self.linear_probe, dim=0),
+                "d_model row col option, d_model row col option ->",
+            ) ** 2 * self.args.penalty_weight
+            self.log("penalisation", penalisation)
+            return loss + penalisation
 
         self.log("train_loss", loss)
         return loss
