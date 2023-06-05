@@ -480,15 +480,16 @@ for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", 
 
 # %% Similarity between mine and theirs (for each square)
 def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
-                        v2: Float[Tensor, '*n_vectors rows cols'], **kwargs):
+                        v2: Float[Tensor, '*n_vectors rows cols'],
+                        name: str = ""):
     v1 = v1.flatten(end_dim=-3)
     v2 = v2.flatten(end_dim=-3)
     sim = einops.einsum(
-        v1,  # / t.norm(v1, dim=0),
-        v2,  # / t.norm(v2, dim=0),
+        v1 / t.norm(v1, dim=0),
+        v2 / t.norm(v2, dim=0),
         "d_model rows cols, d_model rows cols -> rows cols",
     )
-    plot_square_as_board(sim, title="Cosine similarity between mine and their vectors of the probe")
+    plot_square_as_board(sim, title=f"Cosine similarity between {name}")
 
 
 plot_similarities_2(my_probe, their_probe)
@@ -736,7 +737,9 @@ wandb.finish()
 # %% Compute the accuracy of the probe
 
 
+@t.inference_mode()
 def probe_accuracy(
+    model: HookedTransformer,
     probe: Float[Tensor, "d_model rows cols options"],
     game_tokens: Int[Tensor, "batch game_len"],
     game_board_index: Int[Tensor, "batch game_len"],
@@ -746,27 +749,28 @@ def probe_accuracy(
 ) -> Float[Tensor, "batch"]:
     # We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
 
-    flipped_focus_states = focus_states * alternating[None, :, None, None]
+    alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(60)])
+
+    states = move_sequence_to_state(game_board_index)
+    flipped_states = states * alternating[:, None, None]
 
     # We now convert to one-hot encoded vectors
-    focus_states_flipped_one_hot = state_stack_to_one_hot(t.tensor(flipped_focus_states))
+    states_flipped_one_hot = state_stack_to_one_hot(t.tensor(flipped_states))
 
     # Take the argmax (i.e. the index of option empty/their/mine)
-    focus_states_flipped_value = focus_states_flipped_one_hot.argmax(dim=-1)
+    states_flipped_value = states_flipped_one_hot.argmax(dim=-1)
 
-    focus_moves = slice(pos_start, args.pos_end)
-    alternating = np.array([-1 if i % 2 == 0 else 1 for i in range(60)])
+    moves = slice(pos_start, pos_end)
 
     state_stack = move_sequence_to_state(game_board_index)
-    state_stack = state_stack[:, focus_moves]
-    state_stack = einops.einsum(state_stack, alternating[focus_moves],
+    state_stack = state_stack[:, moves]
+    state_stack = einops.einsum(state_stack, alternating[moves],
                                 "batch move row col, move -> batch move row col")
-    state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
 
     act_name = utils.get_act_name("resid_post", layer)
     with t.inference_mode():
         _, cache = model.run_with_cache(
-            game_tokens[:, :-1],  # Not the last move
+            game_tokens[:, :-1].to(model.cfg.device),  # Not the last move
             names_filter=lambda name: name == act_name,
         )
 
@@ -775,21 +779,34 @@ def probe_accuracy(
         "game move d_model, d_model row col options -> game move row col options")
 
     probe_out_value = probe_out.argmax(dim=-1)
+    print(probe_out_value.shape)
+    print(states_flipped_value.shape)
 
-    correct_answers = (probe_out_value.cpu() == focus_states_flipped_value[:, :-1])[:, focus_moves]
+    correct_answers = (probe_out_value.cpu()  == states_flipped_value[:, :-1])[:, moves]
     accuracy = einops.reduce(correct_answers.float(), "game move row col -> row col", "mean")
 
+    print(accuracy.shape)
     plot_square_as_board(
         1 - accuracy,
-        title="Average Error Rate of Linear Probe",
-        facet_col=0, facet_labels=["Black to Play moves", "All Moves"],
-        zmax=0.25, zmin=-0.25
+        title="Accuracy Rate of Linear Probe",
     )
 
 # %%
 probe_accuracy(
+    model,
     litmodel.linear_probe,
-    full_games_tokens[-50:],
-    full_board_labels[-50:],
+    full_games_tokens[-100:],
+    full_games_board_index[-100:],
 )
+# %%
+plot_similarities_2(litmodel.linear_probe[..., 0], blank_probe,
+                    "New and old blank probe")
+# %%
+plot_similarities_2(litmodel.linear_probe[..., 1], my_probe,
+                    "New and old mine probe")
+
+# %%
+plot_similarities_2(litmodel.linear_probe[..., 2], their_probe,
+                    "New and old their probe")
+
 # %%
