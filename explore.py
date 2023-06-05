@@ -1,50 +1,43 @@
 # %%
 import os
 
-from pytorch_lightning.utilities.types import STEP_OUTPUT
-
-os.environ["ACCELERATE_DISABLE_RICH"] = "1"
+# os.environ["ACCELERATE_DISABLE_RICH"] = "1"
+import copy
+import dataclasses
+import itertools
+import random
 import sys
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+
+import einops
+import numpy as np
+import plotly.express as px
 import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch import Tensor
-from torch.utils.data import DataLoader
-import numpy as np
-import einops
-import wandb
-from ipywidgets import interact
-import plotly.express as px
-from pathlib import Path
-import itertools
-import random
-from IPython.display import display
-import wandb
-from jaxtyping import Float, Int, Bool, jaxtyped
-from typing import Any, List, Literal, Union, Optional, Tuple, Callable, Dict
-from functools import partial
-import copy
-import dataclasses
-import datasets
-from IPython.display import HTML
 import transformer_lens
 import transformer_lens.utils as utils
-from transformer_lens.hook_points import HookedRootModule, HookPoint
-from transformer_lens import (
-    HookedTransformer,
-    HookedTransformerConfig,
-    FactoredMatrix,
-    ActivationCache,
-)
-from tqdm.notebook import tqdm
-from dataclasses import dataclass
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
-import pytorch_lightning as pl
+import wandb
+from IPython.display import HTML, display
+from ipywidgets import interact
+from jaxtyping import Bool, Float, Int, jaxtyped
+from neel_plotly import line, scatter
+# import pytorch_lightning as pl
+# from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from rich import print as rprint
-import pandas as pd
+from torch import Tensor
+from torch.utils.data import DataLoader
+from tqdm.notebook import tqdm
+from transformer_lens import (ActivationCache, FactoredMatrix, HookedTransformer,
+                              HookedTransformerConfig)
+from transformer_lens.hook_points import HookedRootModule, HookPoint
+
 from plotly_utils import imshow
-from neel_plotly import scatter, line
+
 # %%
 
 OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
@@ -54,15 +47,8 @@ if not OTHELLO_ROOT.exists():
     os.system("git clone https://github.com/likenneth/othello_world")
 
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
-    plot_board,
-    plot_single_board,
-    plot_board_log_probs,
-    to_string,
-    to_int,
-    int_to_label,
-    string_to_label,
-    OthelloBoardState,
-)
+    OthelloBoardState, int_to_label, plot_board, plot_board_log_probs, plot_single_board,
+    string_to_label, to_int, to_string)
 
 # %%
 t.set_grad_enabled(False)
@@ -87,7 +73,6 @@ model = HookedTransformer(cfg)
 sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth")
 # champion_ship_sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "championship_model.pth")
 model.load_state_dict(sd)
-
 
 # %%
 full_games_tokens: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
@@ -162,7 +147,7 @@ def plot_square_as_board(state: Float[Tensor, "... rows=8 cols=8"],
 
 # %%
 
-num_games = 100
+num_games = 50
 focus_games_tokens = full_games_tokens[:num_games]
 focus_games_board_index = full_games_board_index[:num_games]
 
@@ -214,6 +199,7 @@ if False:
         title="First 16 moves of first game",
         color_continuous_scale="Greys",
     )
+
 
 # %%
 def state_stack_to_one_hot(
@@ -372,54 +358,127 @@ def zero_ablation(
 
 
 # %%
-individual_heads = True
-get_metrics = lambda model: get_loss(model, focus_games_tokens, focus_games_board_index, 0, -1)
-metrics = zero_ablation(model, get_metrics, individual_heads)
-# %%
-base_metrics = get_metrics(model)
+RUN_ABLATIONS = False
+
+if RUN_ABLATIONS:
+    individual_heads = True
+    get_metrics = lambda model: get_loss(model, focus_games_tokens, focus_games_board_index, 0, -1)
+    metrics = zero_ablation(model, get_metrics, individual_heads)
+    base_metrics = get_metrics(model)
 # %%
 # Plotting the results
-x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["All Heads", "MLP"]
-y = [f"Layer {i}" for i in range(model.cfg.n_layers)]
-if not individual_heads:
-    x = x[-2:]
+if RUN_ABLATIONS:
+    x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["All Heads", "MLP"]
+    y = [f"Layer {i}" for i in range(model.cfg.n_layers)]
+    if not individual_heads:
+        x = x[-2:]
 
-fig_1 = imshow(
-    metrics[0] - base_metrics[0],
-    title="Loss after zeroing each component",
-    x=x,
-    y=y,
-)
-fig_1.write_image("loss_ablation_each_component.svg")
-imshow(
-    metrics[1] - base_metrics[1],
-    title="Accuracy after zeroing each component",
-    x=x,
-    y=y,
-).write_image("accuracy_ablation_each_component.svg")
+    imshow(
+        metrics[0] - base_metrics[0],
+        title="Loss after zeroing each component",
+        x=x,
+        y=y,
+    )
+    imshow(
+        metrics[1] - base_metrics[1],
+        title="Accuracy after zeroing each component",
+        x=x,
+        y=y,
+    )
 
 # %% Are Attention heads even useful?
+if RUN_ABLATIONS:
+    # Abblate all attention after the first layer
+    for start_layer in range(model.cfg.n_layers):
 
-# Abblate all attention after the first layer
-for start_layer in range(model.cfg.n_layers):
+        def filter(name: str):
+            if not name.startswith("blocks."):
+                # 'hook_embed' or 'hook_pos_embed' or 'ln_final.hook_scale' or 'ln_final.hook_normalized'
+                return False
 
-    def filter(name: str):
-        if not name.startswith("blocks."):
-            # 'hook_embed' or 'hook_pos_embed' or 'ln_final.hook_scale' or 'ln_final.hook_normalized'
-            return False
+            layer = int(name.split(".")[1])
 
-        layer = int(name.split(".")[1])
+            return layer >= start_layer and "attn_out" in name
 
-        return layer >= start_layer and "attn_out" in name
-
-    with model.hooks(fwd_hooks=[(filter, zero_ablation_hook)]):
-        metrics = get_metrics(model)
-        print(f"Layer {start_layer} ablation:", metrics)
+        with model.hooks(fwd_hooks=[(filter, zero_ablation_hook)]):
+            metrics = get_metrics(model)
+            print(f"Layer {start_layer} ablation:", metrics)
 
 # %% Find dataset example of when the model makes mistakes
 
 t.cuda.empty_cache()
 print("GPU memory:", t.cuda.memory_allocated() / 1e9, "GB")
+
 # %%
-# Find dataset examples where the model makes mistakes
+# Exploration of the probe
+full_linear_probe: Float[Tensor, "mode=3 d_model rows=8 cols=8 options=3"] = t.load(
+    OTHELLO_MECHINT_ROOT / "main_linear_probe.pth", map_location=device)
+
+blank_index = 0
+black_to_play_index = 1
+white_to_play_index = 2
+their_index = 1
+my_index = 2
+# (d_model, rows, cols, options)
+linear_probe = t.zeros(cfg.d_model, 8, 8, 3, device=device)
+"""The linear probe is a tensor of shape (d_model, rows, cols, options) where options are:
+- 0: blank
+- 1: their piece
+- 2: my piece
+"""
+
+linear_probe[..., blank_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 0] +
+                                        full_linear_probe[white_to_play_index, ..., 0])
+linear_probe[..., their_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 1] +
+                                        full_linear_probe[white_to_play_index, ..., 2])
+linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 2] +
+                                     full_linear_probe[white_to_play_index, ..., 1])
+
+# %%
+# Looking at the cosine similarity between the vectors of the blank probe
+# (and also the other probes)
+blank_probe = linear_probe[..., blank_index]
+their_probe = linear_probe[..., their_index]
+my_probe = linear_probe[..., my_index]
+# %%
+
+
+def plot_similarities(vectors: Float[Tensor, '*n_vectors dim'], **kwargs):
+    vectors = vectors.flatten(end_dim=-2)
+    sim = einops.einsum(vectors, vectors, "vec_1 dim, vec_2 dim -> vec_1 vec_2")
+    imshow(sim, **kwargs)
+
+
+for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", "my"]):
+    probe = einops.rearrange(probe, "d_model rows cols -> (rows cols) d_model")
+    plot_similarities(probe,
+                      title=f"Similarity between {name} vectors",
+                      x=full_board_labels,
+                      y=full_board_labels)
+
+# %% Similarity between mine and theirs (for each square)
+sim = einops.einsum(
+    my_probe / t.norm(my_probe, dim=0),
+    their_probe / t.norm(their_probe, dim=0),
+    "d_model rows cols, d_model rows cols -> rows cols",
+)
+plot_square_as_board(sim, title="Cosine similarity between mine and their vectors of the probe")
+
+# %% UMAP on the vectors of the probe
+import umap
+import umap.plot
+import pandas as pd
+#%%
+vectors = einops.rearrange(linear_probe, "d_model rows cols options -> (options rows cols) d_model")
+
+mapper = umap.UMAP(metric='cosine').fit(vectors.cpu().numpy())
+#%%
+labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
+hover_data = pd.DataFrame({
+    "square": full_board_labels * 3,
+    "probe": labels,
+})
+
+umap.plot.show_interactive(
+    umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
 # %%
