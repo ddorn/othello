@@ -29,8 +29,8 @@ from IPython.display import HTML, display
 from ipywidgets import interact
 from jaxtyping import Bool, Float, Int, jaxtyped
 from neel_plotly import line, scatter
-# import pytorch_lightning as pl
-# from pytorch_lightning.loggers import CSVLogger, WandbLogger
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from rich import print as rprint
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -171,6 +171,8 @@ def move_sequence_to_state(
     Moves are encoded as integers from 0 to 63.
     If `only_valid` is True, then the board state is a one-hot encoding of the valid moves
     otherwise, white=-1, empty=0, black=1.
+
+    Output shape: `(batch, moves, rows=8, cols=8)
     """
     assert len(moves_board_index.shape) == 2
 
@@ -482,8 +484,8 @@ def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
     v1 = v1.flatten(end_dim=-3)
     v2 = v2.flatten(end_dim=-3)
     sim = einops.einsum(
-        v1, # / t.norm(v1, dim=0),
-        v2, # / t.norm(v2, dim=0),
+        v1,  # / t.norm(v1, dim=0),
+        v2,  # / t.norm(v2, dim=0),
         "d_model rows cols, d_model rows cols -> rows cols",
     )
     plot_square_as_board(sim, title="Cosine similarity between mine and their vectors of the probe")
@@ -569,4 +571,164 @@ print(f"Mean abs cosine similarity: {cosine_sim.abs().mean():.3f}")
 
 # %% plot histogram of cosine similarities
 px.histogram(cosine_sim.flatten(), title="Cosine similarity between random vectors")
+
+
+# %% Training the probe!
+@dataclass
+class ProbeTrainingArgs:
+    # Which layer, and which positions in a game sequence to probe
+    layer: int = 6
+    pos_start: int = 5
+    pos_end: int = model.cfg.n_ctx - 5
+    length: int = pos_end - pos_start
+    alternating: Tensor = t.tensor([1 if i % 2 == 0 else -1 for i in range(length)], device=device)
+
+    # Game state (options are blank/mine/theirs)
+    options: int = 3
+    rows: int = 8
+    cols: int = 8
+
+    # Standard training hyperparams
+    max_epochs: int = 8
+    num_games: int = 50000
+
+    # Hyperparams for optimizer
+    batch_size: int = 256
+    lr: float = 1e-4
+    betas: Tuple[float, float] = (0.9, 0.99)
+    wd: float = 0.01
+
+    # Misc.
+    probe_name: str = "main_linear_probe"
+
+    # Code to get randomly initialized probe
+    def setup_linear_probe(self, model: HookedTransformer):
+        linear_probe = t.randn(
+            model.cfg.d_model,
+            self.rows,
+            self.cols,
+            self.options,
+            requires_grad=True,
+            device=device,
+        ) / np.sqrt(model.cfg.d_model)
+        return linear_probe
+
+
+# def seq_to_state_stack(str_moves):
+#     board = OthelloBoardState()
+#     states = []
+#     for move in str_moves:
+#         board.umpire(move)
+#         states.append(np.copy(board.state))
+#     states = np.stack(states, axis=0)
+#     return states
+
+
+class LitLinearProbe(pl.LightningModule):
+
+    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs):
+        super().__init__()
+        self.model = model
+        self.args = args
+        self.linear_probe: Float[Tensor,
+                                 "d_model rows cols options"] = args.setup_linear_probe(model)
+        """shape: (d_model, rows, cols, options)"""
+        pl.seed_everything(42, workers=True)
+
+    def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
+        games_token = full_games_tokens[batch.cpu()]
+        games_board_index = full_games_board_index[batch.cpu()]
+        state_stack = move_sequence_to_state(games_board_index)
+        state_stack = einops.einsum(state_stack, self.args.alternating,
+                                    "batch move row col, move -> batch move row col")
+        state_stack = state_stack[:, self.args.pos_start:self.args.pos_end]
+        state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
+        batch_size = self.args.batch_size
+        game_len = self.args.length
+
+        # games_int = tensor of game sequences, each of length 60
+        # This is the input to our model
+        assert isinstance(games_token, Int[Tensor, f"batch={batch_size} full_game_len=60"])
+
+        # state_stack_one_hot = tensor of one-hot encoded states for each game
+        # We'll multiply this by our probe's estimated log probs along the `options` dimension, to get probe's estimated log probs for the correct option
+        assert isinstance(
+            state_stack_one_hot,
+            Int[
+                Tensor,
+                f"batch={batch_size} game_len={game_len} rows=8 cols=8 options=3",
+            ],
+        )
+
+        act_name = utils.get_act_name("resid_post", self.args.layer)
+
+        with t.inference_mode():
+            _, cache = self.model.run_with_cache(
+                games_token[:, :-1],  # Not the last move
+                names_filter=lambda name: name == act_name,
+            )
+
+        resid_post: Float[Tensor, "batch moves d_model"]
+        resid_post = cache[act_name][:, self.args.pos_start:self.args.pos_end]
+
+        probe_logits = einops.einsum(
+            self.linear_probe,
+            resid_post,
+            "d_model row col option, batch move d_model -> batch move row col option",
+        )
+        probe_logprobs = probe_logits.log_softmax(dim=-1)
+        probe_loss = einops.reduce(
+            probe_logprobs * state_stack_one_hot, "batch move row col option -> move row col",
+            "mean") * self.args.options  # Multiply to correct for the mean over options
+
+        loss = -probe_loss.mean(0).sum()  # avg over moves, sum over the board
+
+        self.log("train_loss", -loss)
+        return loss
+
+    def train_dataloader(self):
+        """
+        Returns `games_int` and `state_stack_one_hot` tensors.
+        """
+        n_indices = self.args.num_games - (self.args.num_games % self.args.batch_size)
+        full_train_indices = t.randperm(self.args.num_games)[:n_indices]
+        full_train_indices = einops.rearrange(
+            full_train_indices,
+            "(batch_idx game_idx) -> batch_idx game_idx",
+            game_idx=self.args.batch_size,
+        )
+        return full_train_indices
+
+    def configure_optimizers(self):
+        return t.optim.AdamW(
+            [self.linear_probe],
+            lr=self.args.lr,
+            betas=self.args.betas,
+            weight_decay=self.args.wd,
+        )
+
+
 # %%
+# Create the model & training system
+args = ProbeTrainingArgs()
+litmodel = LitLinearProbe(model, args)
+
+# You can choose either logger
+# logger = CSVLogger(save_dir=os.getcwd() + "/logs", name=args.probe_name)
+logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
+
+# Train the model
+trainer = pl.Trainer(
+    max_epochs=args.max_epochs,
+    logger=logger,
+    log_every_n_steps=1,
+)
+trainer.fit(model=litmodel)
+# %%
+wandb.finish()
+# %%
+black_to_play_index = 0
+white_to_play_index = 1
+blank_index = 0
+their_index = 1
+my_index = 2
