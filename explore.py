@@ -71,7 +71,7 @@ cfg = HookedTransformerConfig(
     normalization_type="LNPre",
     device=device,
 )
-model = HookedTransformer(cfg)
+model = HookedTransformer(cfg).to(device)
 # %%
 sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth")
 # champion_ship_sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "championship_model.pth")
@@ -165,12 +165,13 @@ def one_hot(list_of_ints: List[int], num_classes=64):
 
 def move_sequence_to_state(
     moves_board_index: Int[Tensor, "batch moves"],
-    only_valid: Literal[True] = False,
+    mode: Literal["valid", "alternate", "normal"] = "normal",
 ) -> Float[Tensor, "batch moves rows=8 cols=8"]:
     """Convert sequences of moves into a sequence of board states.
     Moves are encoded as integers from 0 to 63.
-    If `only_valid` is True, then the board state is a one-hot encoding of the valid moves
-    otherwise, white=-1, empty=0, black=1.
+
+    If `mode="valid"`, then the board state is a one-hot encoding of the valid moves.
+    If `mode="alternate"`, then the board state encoded as mine (+1) and their (-1) pieces.
 
     Output shape: `(batch, moves, rows=8, cols=8)
     """
@@ -181,15 +182,18 @@ def move_sequence_to_state(
         board = OthelloBoardState()
         for m, move in enumerate(moves):
             board.umpire(move.item())
-            if only_valid:
+            if mode == "valid":
                 states[b, m] = one_hot(board.get_valid_moves()).reshape(8, 8)
             else:
                 states[b, m] = t.tensor(board.state)
+
+    if mode == "alternate":
+        states = alternate_states(states)
     return states
 
 
 focus_states = move_sequence_to_state(focus_games_board_index)
-focus_valid_moves = move_sequence_to_state(focus_games_board_index, only_valid=True)
+focus_valid_moves = move_sequence_to_state(focus_games_board_index, mode="valid")
 
 print("focus states:", focus_states.shape)
 print("focus_valid_moves", focus_valid_moves.shape)
@@ -236,15 +240,24 @@ def state_stack_to_one_hot(
 
 # %%
 
-# We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
-alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(focus_games_tokens.shape[1])])
-flipped_focus_states = focus_states * alternating[None, :, None, None]
 
-# We now convert to one-hot encoded vectors
-focus_states_flipped_one_hot = state_stack_to_one_hot(flipped_focus_states)
+def alternate_states(
+    state_stack: Float[Tensor, "games moves rows=8 cols=8"]
+) -> Float[Tensor, "games moves rows=8 cols=8"]:
+    """
+    Convert the states to be in terms of my (+1) and their (-1), rather than black and white.
+    """
+    alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(state_stack.shape[1])])
+    return state_stack * alternating[:, None, None]
 
-# Take the argmax (i.e. the index of option empty/their/mine)
-focus_states_flipped_value = focus_states_flipped_one_hot.argmax(dim=-1).to(device)
+
+# flipped_focus_states = alternate_states(focus_states)
+
+# # We now convert to one-hot encoded vectors
+# focus_states_flipped_one_hot = state_stack_to_one_hot(flipped_focus_states)
+
+# # Take the argmax (i.e. the index of option empty/their/mine)
+# focus_states_flipped_value = focus_states_flipped_one_hot.argmax(dim=-1).to(device)
 
 # %%
 # Zero ablation of every head and MLP
@@ -582,7 +595,6 @@ class ProbeTrainingArgs:
     pos_start: int = 5
     pos_end: int = model.cfg.n_ctx - 5
     length: int = pos_end - pos_start
-    alternating: Tensor = t.tensor([1 if i % 2 == 0 else -1 for i in range(length)])
 
     # Game state (options are blank/mine/theirs)
     options: int = 3
@@ -600,7 +612,7 @@ class ProbeTrainingArgs:
     wd: float = 0.01
 
     # Othognal regularization (to an other probe)
-    penalty_weight: float = 10000.0
+    penalty_weight: float = 10_000.0
 
     # Misc.
     probe_name: str = "main_linear_probe"
@@ -622,27 +634,16 @@ class ProbeTrainingArgs:
         return linear_probe
 
 
-# def seq_to_state_stack(str_moves):
-#     board = OthelloBoardState()
-#     states = []
-#     for move in str_moves:
-#         board.umpire(move)
-#         states.append(np.copy(board.state))
-#     states = np.stack(states, axis=0)
-#     return states
-
-
 class LitLinearProbe(pl.LightningModule):
 
-    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs, old_probe: Optional[Float[Tensor, "d_model rows cols options"]] = None):
+    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs,
+                 *old_probes: Float[Tensor, "d_model rows cols options"]):
         super().__init__()
-        for name, _ in self.named_parameters():
-            print(name)
         self.model = model
         self.args = args
         self.linear_probe = nn.Parameter(args.setup_linear_probe(model))
         """shape: (d_model, rows, cols, options)"""
-        self.old_probe = old_probe
+        self.old_probes = [old_probe / t.norm(old_probe, dim=0) for old_probe in old_probes]
 
         pl.seed_everything(42, workers=True)
 
@@ -651,16 +652,13 @@ class LitLinearProbe(pl.LightningModule):
 
         games_token = full_games_tokens[batch.cpu()]
         games_board_index = full_games_board_index[batch.cpu()]
-        state_stack = move_sequence_to_state(games_board_index)
+        state_stack = move_sequence_to_state(games_board_index, mode="alternate")
         state_stack = state_stack[:, focus_moves]
-        state_stack = einops.einsum(state_stack, self.args.alternating,
-                                    "batch move row col, move -> batch move row col")
+
         state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
         batch_size = self.args.batch_size
         game_len = self.args.length
 
-        # games_int = tensor of game sequences, each of length 60
-        # This is the input to our model
         assert isinstance(games_token, Int[Tensor, f"batch={batch_size} full_game_len=60"])
 
         # state_stack_one_hot = tensor of one-hot encoded states for each game
@@ -690,23 +688,24 @@ class LitLinearProbe(pl.LightningModule):
             "d_model row col option, batch move d_model -> batch move row col option",
         )
         probe_logprobs = probe_logits.log_softmax(dim=-1)
-        probe_loss = einops.reduce(
-            probe_logprobs * state_stack_one_hot, "batch move row col option -> move row col",
-            "mean") * self.args.options  # Multiply to correct for the mean over options
+        # Multiply to correct for the mean over options
+        loss = -(probe_logprobs * state_stack_one_hot).mean() * self.args.options
 
-        loss = -probe_loss.mean(0).sum()  # avg over moves, sum over the board
-        self.log("train_loss", loss)
-
-        if self.old_probe is not None:
-            penalisation = einops.einsum(
-                self.old_probe / t.norm(self.old_probe, dim=0),
+        penalisation = 0.0
+        for old_probe in self.old_probes:
+            cosine_sim_sq = einops.einsum(
+                old_probe,
                 self.linear_probe / t.norm(self.linear_probe, dim=0),
                 "d_model row col option, d_model row col option -> row col option",
-            ) ** 2
-            penalisation = penalisation.mean() * self.args.penalty_weight
-            self.log("penalisation", penalisation)
-            return loss + penalisation
-        return loss
+            )**2
+            penalisation += cosine_sim_sq.mean()
+
+        total_loss = loss + penalisation * self.args.penalty_weight
+
+        self.log("train_loss", loss)
+        self.log("penalisation", penalisation)
+        self.log("total_loss", total_loss)
+        return total_loss
 
     def train_dataloader(self):
         """
@@ -732,13 +731,14 @@ class LitLinearProbe(pl.LightningModule):
 
 # %%
 # Create the model & training system
-TRAIN_FIRST_PROBE = True
+path = Path("probes") / f"main_linear_probe.pt"
+path.parent.mkdir(exist_ok=True)
+
+TRAIN_FIRST_PROBE = False
 if TRAIN_FIRST_PROBE:
     args = ProbeTrainingArgs()
     litmodel = LitLinearProbe(model, args)
 
-    # You can choose either logger
-    # logger = CSVLogger(save_dir=os.getcwd() + "/logs", name=args.probe_name)
     logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
 
     # Train the model
@@ -749,14 +749,21 @@ if TRAIN_FIRST_PROBE:
     )
     trainer.fit(model=litmodel)
     wandb.finish()
-else:
-    checkpoint_path = "logs/main_linear_probe/zq4ze0zt/checkpoints/epoch=7-step=1560.ckpt"
-    litmodel = LitLinearProbe.load_from_checkpoint(
-        checkpoint_path,
-        model=model,
-        args=ProbeTrainingArgs(),
-    )
 
+    new_probe = litmodel.linear_probe
+    if not path.exists():
+        t.save(new_probe, path)
+        print(f"Saved probe to {path.resolve()}")
+
+else:
+    new_probe = t.load(path, map_location=device)
+    print(f"Loaded probe from {path.resolve()}")
+
+    new_probe = t.stack([
+        new_probe[..., 0],
+        new_probe[..., 2],
+        new_probe[..., 1],
+    ], dim=-1)
 
 # %% Compute the accuracy of the probe
 
@@ -771,25 +778,10 @@ def probe_accuracy(
     pos_end: int = -5,
     layer: int = 6,
 ) -> None:
-    # We first convert the board states to be in terms of my (+1) and their (-1), rather than black and white
-
-    alternating = t.tensor([-1 if i % 2 == 0 else 1 for i in range(60)])
-
-    states = move_sequence_to_state(game_board_index)
-    flipped_states = states * alternating[:, None, None]
-
-    # We now convert to one-hot encoded vectors
-    states_flipped_one_hot = state_stack_to_one_hot(t.tensor(flipped_states))
-
-    # Take the argmax (i.e. the index of option empty/their/mine)
-    states_flipped_value = states_flipped_one_hot.argmax(dim=-1)
-
     moves = slice(pos_start, pos_end)
 
-    state_stack = move_sequence_to_state(game_board_index)
-    state_stack = state_stack[:, moves]
-    state_stack = einops.einsum(state_stack, alternating[moves],
-                                "batch move row col, move -> batch move row col")
+    states = move_sequence_to_state(game_board_index)
+    flipped_states = alternate_states(states)[:, moves]
 
     act_name = utils.get_act_name("resid_post", layer)
     with t.inference_mode():
@@ -802,49 +794,83 @@ def probe_accuracy(
         cache["resid_post", layer], probe,
         "game move d_model, d_model row col options -> game move row col options")
 
-    probe_out_value = probe_out.argmax(dim=-1)
-    print(probe_out_value.shape)
-    print(states_flipped_value.shape)
+    probe_out_value = probe_out.argmax(dim=-1)[:, moves]
+    probe_out_value[probe_out_value == 2] = -1
 
-    correct_answers = (probe_out_value.cpu()  == states_flipped_value[:, :-1])[:, moves]
+    correct_answers = probe_out_value.cpu() == flipped_states[:, :-1]
     accuracy = einops.reduce(correct_answers.float(), "game move row col -> row col", "mean")
 
-    print(accuracy.shape)
-    plot_square_as_board(
-        accuracy,
-        title="Accuracy Rate of Linear Probe",
+    display(plot_square_as_board(
+        1 - accuracy,
+        title="Error Rate of Linear Probe",
+    ))
+
+    return accuracy
+
+
+# %%
+neel_acc = probe_accuracy(
+    model,
+    linear_probe,
+    full_games_tokens[-100:],
+    full_games_board_index[-100:],
+)
+
+my_acc = probe_accuracy(
+    model,
+    new_probe,
+    full_games_tokens[-100:],
+    full_games_board_index[-100:],
+)
+
+plot_square_as_board(
+    my_acc - neel_acc,
+    title="Difference in Error Rate of Linear Probe",
+)
+
+# %%
+plot_similarities_2(new_probe[..., 0], blank_probe, "New and old blank probe")
+# %%
+plot_similarities_2(new_probe[..., 1], their_probe, "New and old mine probe")
+
+# %%
+plot_similarities_2(new_probe[..., 2], my_probe, "New and old their probe")
+
+# %% Training an orthogonal probe
+path = Path("probes") / f"orthogonal_probe.pt"
+path.parent.mkdir(exist_ok=True)
+
+TRAIN_ORTHINGAL_PROBE = False
+if TRAIN_ORTHINGAL_PROBE:
+    args = ProbeTrainingArgs(probe_name='orthogonal_probe')
+    lit_ortho_probe = LitLinearProbe(model, args, new_probe).to(device)
+
+    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        logger=logger,
+        log_every_n_steps=1,
     )
+    trainer.fit(model=lit_ortho_probe)
+    wandb.finish()
+
+    ortho_probe = lit_ortho_probe.linear_probe
+    if not path.exists():
+        t.save(ortho_probe, path)
+        print(f"Saved probe to {path.resolve()}")
+else:
+    ortho_probe = t.load(path, map_location=device)
+    print(f"Loaded probe from {path.resolve()}")
 
 # %%
 probe_accuracy(
     model,
-    litmodel.linear_probe,
-    full_games_tokens[-100:],
-    full_games_board_index[-100:],
+    ortho_probe,
+    full_games_tokens[-300:],
+    full_games_board_index[-300:],
 )
 # %%
-plot_similarities_2(litmodel.linear_probe[..., 0], blank_probe,
-                    "New and old blank probe")
-# %%
-plot_similarities_2(litmodel.linear_probe[..., 1], my_probe,
-                    "New and old mine probe")
+for i in range(3):
+    plot_similarities_2(ortho_probe[..., i], linear_probe[..., i], f"Orthogonal and new probe {i}")
 
 # %%
-plot_similarities_2(litmodel.linear_probe[..., 2], their_probe,
-                    "New and old their probe")
-
-# %% Training an orthogonal probe
-args = ProbeTrainingArgs(probe_name='orthogonal_probe')
-lit_ortho_probe = LitLinearProbe(model, args, litmodel.linear_probe)
-
-logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-
-# Train the model
-trainer = pl.Trainer(
-    max_epochs=args.max_epochs,
-    logger=logger,
-    log_every_n_steps=1,
-)
-trainer.fit(model=lit_ortho_probe)
-# %%
-wandb.finish()
