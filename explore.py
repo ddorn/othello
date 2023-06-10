@@ -2,8 +2,6 @@
 import os
 
 # os.environ["ACCELERATE_DISABLE_RICH"] = "1"
-import copy
-import dataclasses
 import itertools
 import random
 import sys
@@ -22,7 +20,6 @@ import torch as t
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import transformer_lens
 import transformer_lens.utils as utils
 import wandb
 from IPython.display import HTML, display
@@ -55,9 +52,10 @@ device = "cuda" if t.cuda.is_available() else "cpu"
 cfg, model = get_othello_gpt(device)
 
 # %% Loading sample data
-
+full_games_tokens, full_games_board_index = load_sample_games()
 num_games = 50
-focus_games_tokens, focus_games_board_index = utils.load_sample_games(num_games)
+focus_games_tokens = full_games_tokens[:num_games]
+focus_games_board_index = full_games_board_index[:num_games]
 
 focus_states = move_sequence_to_state(focus_games_board_index)
 focus_valid_moves = move_sequence_to_state(focus_games_board_index, mode="valid")
@@ -77,65 +75,6 @@ print("focus_valid_moves", focus_valid_moves.shape)
 # Zero ablation of every head and MLP
 # We try to see how much the overall loss of the model increases when ablating each component
 # First, we evalute the loss only on the focus games
-
-
-@t.inference_mode()
-def get_loss(
-    model: HookedTransformer,
-    games_token: Int[Tensor, "batch game_len rows cols"],
-    games_board_index: Int[Tensor, "batch game_len"],
-    move_start: int = 5,
-    move_end: int = -5,
-) -> Float[Tensor, "2"]:
-    """Get the loss of the model on the given games.
-
-    Args:
-        model (HookedTransformer): the model to evaluate
-        games_token (Int[Tensor, "batch game_len rows cols"]): the tokenized games, integers between 0 and 60
-        games_board_index (Int[Tensor, "batch game_len"]): the board index of the games, integers between 0 and 64
-        move_start (int, optional): The first move to consider. Defaults to 5.
-        move_end (int, optional): The last move to consider. Defaults to -5.
-
-    Returns:
-        Float[Tensor, "2"]: the loss and accuracy of the model on the given games
-    """
-    # This is the input to our model
-    assert isinstance(games_token, Int[Tensor, "batch full_game_len=60"])
-
-    valid_moves = move_sequence_to_state(games_board_index, only_valid=True)
-    valid_moves = valid_moves[:, move_start:move_end].to(device)
-    # print("valid moves:", valid_moves.shape)
-    assert isinstance(valid_moves, Float[Tensor, f"batch game_len rows=8 cols=8"])
-
-    logits = model(games_token[:, :move_end])[:, move_start:]
-    # print("model output:", logits.shape)
-    logits_as_board = logits_to_board(logits)
-    # print("logit as board:", logits_as_board.shape)
-
-    # Flatten the last 2 dimensions to have a 64-dim vector instead of 8x8
-    logits_as_board = einops.rearrange(
-        logits_as_board,
-        "batch move row col -> batch move (row col)",
-    )
-    valid_moves = einops.rearrange(
-        valid_moves,
-        "batch move row col -> batch move (row col)",
-    )
-    log_probs = logits_as_board.log_softmax(dim=-1)
-
-    loss = log_probs * valid_moves
-    # print("loss:", loss.shape)
-    loss = -loss.sum(dim=-1).mean()
-
-    # Compute accuracy
-    nb_valid_moves = valid_moves.sum(dim=-1, keepdim=True)
-    predicted = logits_as_board.softmax(dim=-1) > 1 / (2 * nb_valid_moves)
-    correct = predicted == valid_moves
-    accuracy = correct.float().mean()
-
-    # Return one tensor
-    return t.stack([loss, accuracy]).cpu()
-
 
 loss, accuracy = get_loss(model, focus_games_tokens, focus_games_board_index)
 # %%
@@ -302,13 +241,6 @@ my_direction = my_probe - their_probe
 
 # %%
 
-
-def plot_similarities(vectors: Float[Tensor, '*n_vectors dim'], **kwargs):
-    vectors = vectors.flatten(end_dim=-2)
-    sim = einops.einsum(vectors, vectors, "vec_1 dim, vec_2 dim -> vec_1 vec_2")
-    imshow(sim, **kwargs)
-
-
 for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", "my"]):
     probe = einops.rearrange(probe, "d_model rows cols -> (rows cols) d_model")
     plot_similarities(probe,
@@ -316,40 +248,30 @@ for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", 
                       x=full_board_labels,
                       y=full_board_labels)
 
-
 # %% Similarity between mine and theirs (for each square)
-def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
-                        v2: Float[Tensor, '*n_vectors rows cols'],
-                        name: str = ""):
-    v1 = v1.flatten(end_dim=-3)
-    v2 = v2.flatten(end_dim=-3)
-    sim = einops.einsum(
-        v1 / t.norm(v1, dim=0),
-        v2 / t.norm(v2, dim=0),
-        "d_model rows cols, d_model rows cols -> rows cols",
-    )
-    plot_square_as_board(sim, title=f"Cosine similarity between {name}")
-
-
 plot_similarities_2(my_probe, their_probe)
 
 # %% UMAP on the vectors of the probe
-import umap
-import umap.plot
-import pandas as pd
+UMAP = False
+if UMAP:
+    import umap
+    import umap.plot
+    import pandas as pd
 #%%
-vectors = einops.rearrange(linear_probe, "d_model rows cols options -> (options rows cols) d_model")
+if UMAP:
+    vectors = einops.rearrange(linear_probe,
+                               "d_model rows cols options -> (options rows cols) d_model")
 
-mapper = umap.UMAP(metric='cosine').fit(vectors.cpu().numpy())
-#%%
-labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
-hover_data = pd.DataFrame({
-    "square": full_board_labels * 3,
-    "probe": labels,
-})
+    mapper = umap.UMAP(metric='cosine').fit(vectors.cpu().numpy())
 
-umap.plot.show_interactive(
-    umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
+    labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
+    hover_data = pd.DataFrame({
+        "square": full_board_labels * 3,
+        "probe": labels,
+    })
+
+    umap.plot.show_interactive(
+        umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
 
 
 # %%
@@ -412,246 +334,32 @@ print(f"Mean abs cosine similarity: {cosine_sim.abs().mean():.3f}")
 # %% plot histogram of cosine similarities
 px.histogram(cosine_sim.flatten(), title="Cosine similarity between random vectors")
 
-
 # %% Training the probe!
-@dataclass
-class ProbeTrainingArgs:
-    # Which layer, and which positions in a game sequence to probe
-    layer: int = 6
-    pos_start: int = 5
-    pos_end: int = model.cfg.n_ctx - 5
-    length: int = pos_end - pos_start
-
-    # Game state (options are blank/mine/theirs)
-    options: int = 3
-    rows: int = 8
-    cols: int = 8
-
-    # Standard training hyperparams
-    max_epochs: int = 8
-    num_games: int = 50000
-
-    # Hyperparams for optimizer
-    batch_size: int = 256
-    lr: float = 1e-4
-    betas: Tuple[float, float] = (0.9, 0.99)
-    wd: float = 0.01
-
-    # Othognal regularization (to an other probe)
-    penalty_weight: float = 10_000.0
-
-    # Misc.
-    probe_name: str = "main_linear_probe"
-
-    # Code to get randomly initialized probe
-    def setup_linear_probe(self, model: HookedTransformer):
-        linear_probe = t.randn(
-            model.cfg.d_model,
-            self.rows,
-            self.cols,
-            self.options,
-            requires_grad=False,
-            device=device,
-        ) / np.sqrt(model.cfg.d_model)
-        # We want to pass this tensor to the optimizer, so it needs to be a leaf,
-        # and not be a computation of other tensors (here divison by sqrt(d_model))
-        # Thus, we can't use the `requires_grad` argument of `t.randn`.
-        linear_probe.requires_grad = True
-        return linear_probe
-
-
-class LitLinearProbe(pl.LightningModule):
-
-    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs,
-                 *old_probes: Float[Tensor, "d_model rows cols options"]):
-        super().__init__()
-        self.model = model
-        self.args = args
-        self.linear_probe = nn.Parameter(args.setup_linear_probe(model))
-        """shape: (d_model, rows, cols, options)"""
-        self.old_probes = [old_probe / t.norm(old_probe, dim=0) for old_probe in old_probes]
-
-        pl.seed_everything(42, workers=True)
-
-    def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
-        focus_moves = slice(self.args.pos_start, self.args.pos_end)
-
-        games_token = full_games_tokens[batch.cpu()]
-        games_board_index = full_games_board_index[batch.cpu()]
-        state_stack = move_sequence_to_state(games_board_index, mode="alternate")
-        state_stack = state_stack[:, focus_moves]
-
-        state_stack_one_hot = state_stack_to_one_hot(state_stack).to(device)
-        batch_size = self.args.batch_size
-        game_len = self.args.length
-
-        assert isinstance(games_token, Int[Tensor, f"batch={batch_size} full_game_len=60"])
-
-        # state_stack_one_hot = tensor of one-hot encoded states for each game
-        # We'll multiply this by our probe's estimated log probs along the `options` dimension, to get probe's estimated log probs for the correct option
-        assert isinstance(
-            state_stack_one_hot,
-            Int[
-                Tensor,
-                f"batch={batch_size} game_len={game_len} rows=8 cols=8 options=3",
-            ],
-        )
-
-        act_name = utils.get_act_name("resid_post", self.args.layer)
-
-        with t.inference_mode():
-            _, cache = self.model.run_with_cache(
-                games_token[:, :-1],  # Not the last move
-                names_filter=lambda name: name == act_name,
-            )
-
-        resid_post: Float[Tensor, "batch moves d_model"]
-        resid_post = cache[act_name][:, focus_moves]
-
-        probe_logits = einops.einsum(
-            self.linear_probe,
-            resid_post,
-            "d_model row col option, batch move d_model -> batch move row col option",
-        )
-        probe_logprobs = probe_logits.log_softmax(dim=-1)
-        # Multiply to correct for the mean over options
-        loss = -(probe_logprobs * state_stack_one_hot).mean() * self.args.options
-
-        penalisation = 0.0
-        for old_probe in self.old_probes:
-            cosine_sim_sq = einops.einsum(
-                old_probe,
-                self.linear_probe / t.norm(self.linear_probe, dim=0),
-                "d_model row col option, d_model row col option -> row col option",
-            )**2
-            penalisation += cosine_sim_sq.mean()
-
-        total_loss = loss + penalisation * self.args.penalty_weight
-
-        self.log("train_loss", loss)
-        self.log("penalisation", penalisation)
-        self.log("total_loss", total_loss)
-        return total_loss
-
-    def train_dataloader(self):
-        """
-        Returns `games_int` and `state_stack_one_hot` tensors.
-        """
-        n_indices = self.args.num_games - (self.args.num_games % self.args.batch_size)
-        full_train_indices = t.randperm(self.args.num_games)[:n_indices]
-        full_train_indices = einops.rearrange(
-            full_train_indices,
-            "(batch_idx game_idx) -> batch_idx game_idx",
-            game_idx=self.args.batch_size,
-        )
-        return full_train_indices
-
-    def configure_optimizers(self):
-        return t.optim.AdamW(
-            [self.linear_probe],
-            lr=self.args.lr,
-            betas=self.args.betas,
-            weight_decay=self.args.wd,
-        )
-
-
-# %%
-# Create the model & training system
-path = Path("probes") / f"main_linear_probe.pt"
-path.parent.mkdir(exist_ok=True)
-
-TRAIN_FIRST_PROBE = False
-if TRAIN_FIRST_PROBE:
-    args = ProbeTrainingArgs()
-    litmodel = LitLinearProbe(model, args)
-
-    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-
-    # Train the model
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        logger=logger,
-        log_every_n_steps=1,
-    )
-    trainer.fit(model=litmodel)
-    wandb.finish()
-
-    new_probe = litmodel.linear_probe
-    if not path.exists():
-        t.save(new_probe, path)
-        print(f"Saved probe to {path.resolve()}")
-
-else:
-    new_probe = t.load(path, map_location=device)
-    print(f"Loaded probe from {path.resolve()}")
-
-    new_probe = t.stack([
-        new_probe[..., 0],
-        new_probe[..., 2],
-        new_probe[..., 1],
-    ], dim=-1)
-
-# %% Compute the accuracy of the probe
-
-
-@t.inference_mode()
-def probe_accuracy(
-    model: HookedTransformer,
-    probe: Float[Tensor, "d_model rows cols options"],
-    game_tokens: Int[Tensor, "batch game_len"],
-    game_board_index: Int[Tensor, "batch game_len"],
-    pos_start: int = 5,
-    pos_end: int = -5,
-    layer: int = 6,
-) -> None:
-    moves = slice(pos_start, pos_end)
-
-    states = move_sequence_to_state(game_board_index)
-    flipped_states = alternate_states(states)[:, moves]
-
-    act_name = utils.get_act_name("resid_post", layer)
-    with t.inference_mode():
-        _, cache = model.run_with_cache(
-            game_tokens[:, :-1].to(model.cfg.device),  # Not the last move
-            names_filter=lambda name: name == act_name,
-        )
-
-    probe_out = einops.einsum(
-        cache["resid_post", layer], probe,
-        "game move d_model, d_model row col options -> game move row col options")
-
-    probe_out_value = probe_out.argmax(dim=-1)[:, moves]
-    probe_out_value[probe_out_value == 2] = -1
-
-    correct_answers = probe_out_value.cpu() == flipped_states[:, :-1]
-    accuracy = einops.reduce(correct_answers.float(), "game move row col -> row col", "mean")
-
-    display(plot_square_as_board(
-        1 - accuracy,
-        title="Error Rate of Linear Probe",
-    ))
-
-    return accuracy
-
-
 # %%
 neel_acc = probe_accuracy(
     model,
     linear_probe,
     full_games_tokens[-100:],
     full_games_board_index[-100:],
+    per_option=True,
 )
+
+# %%
 
 my_acc = probe_accuracy(
     model,
     new_probe,
     full_games_tokens[-100:],
     full_games_board_index[-100:],
+    per_option=True,
 )
 
+# %%
 plot_square_as_board(
     my_acc - neel_acc,
     title="Difference in Error Rate of Linear Probe",
+    facet_col=-1,
+    facet_labels=["Blank", "Mine", "Theirs"],
 )
 
 # %%
@@ -662,41 +370,198 @@ plot_similarities_2(new_probe[..., 1], their_probe, "New and old mine probe")
 # %%
 plot_similarities_2(new_probe[..., 2], my_probe, "New and old their probe")
 
-# %% Training an orthogonal probe
-path = Path("probes") / f"orthogonal_probe.pt"
-path.parent.mkdir(exist_ok=True)
-
-TRAIN_ORTHINGAL_PROBE = False
-if TRAIN_ORTHINGAL_PROBE:
-    args = ProbeTrainingArgs(probe_name='orthogonal_probe')
-    lit_ortho_probe = LitLinearProbe(model, args, new_probe).to(device)
-
-    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        logger=logger,
-        log_every_n_steps=1,
-    )
-    trainer.fit(model=lit_ortho_probe)
-    wandb.finish()
-
-    ortho_probe = lit_ortho_probe.linear_probe
-    if not path.exists():
-        t.save(ortho_probe, path)
-        print(f"Saved probe to {path.resolve()}")
-else:
-    ortho_probe = t.load(path, map_location=device)
-    print(f"Loaded probe from {path.resolve()}")
-
 # %%
 probe_accuracy(
     model,
     ortho_probe,
     full_games_tokens[-300:],
     full_games_board_index[-300:],
+    per_option=True,
 )
 # %%
 for i in range(3):
     plot_similarities_2(ortho_probe[..., i], linear_probe[..., i], f"Orthogonal and new probe {i}")
 
+# %%
+plot_similarities_2(linear_probe[..., 1], linear_probe[..., 2], "Title")
+
+# %% Similarities between the blank probe and the token embeddings
+
+token_embs = model.W_E[1:]
+token_embs_64 = t.zeros((64, token_embs.shape[1]), device=token_embs.device)
+token_embs_64[tokens_to_board] = token_embs
+print(token_embs.shape)
+token_embs_64 = einops.rearrange(token_embs_64, "(rows cols) d_model -> d_model rows cols", rows=8)
+
+plot_similarities_2(
+    linear_probe[..., 0],
+    token_embs_64,
+    name="Blank probe and token embeddings",
+)
+# %%
+
+# ---------------------- #
+# --- World building --- #
+# ---------------------- #
+
+# %%
+
+board = """
+........
+........
+........
+...xo...
+...ox...
+........
+........
+........
+"""
+
+board_2 = """
+........
+........
+........
+..xxxx..
+.xooooo.
+.o..ox..
+.x.oxo..
+........
+"""
+board_3 = """
+........
+........
+........
+...xo...
+...oo...
+....o...
+........
+........
+"""
+
+board_tensor = board_to_tensor(board_3)
+resid = make_residual_stream(board_tensor, linear_probe)
+line(resid)
+plot_square_as_board(board_tensor)
+
+# %% Try to run the model on a virtual residual stream
+
+
+def hook(activation: Float[Tensor, "game move d_model"], hook: HookPoint):
+    activation[:, -1] = resid
+
+
+layer = 4
+act_name = utils.get_act_name("resid_pre", layer)
+osef_input = focus_games_tokens[:1, :20]  # 1 game, 20 moves
+logits = model.run_with_hooks(osef_input, fwd_hooks=[(act_name, hook)])
+
+# Plot what the model predicts
+logits = logits_to_board(logits[0, -1], 'log_prob')
+plot_square_as_board(logits, title="Model predictions")
+
+# %%
+# Compute and show probe vector norms
+probe_norm = new_probe.norm(dim=0)
+# histogram
+px.histogram(probe_norm.cpu().flatten(), title="Probe vector norms", labels={"value": "norm"})
+
+# %%
+
+
+def make_residual_stream(
+    world: Union[Int[Tensor, "row=8 cols=8"], str],
+    probe: Float[Tensor, "d_model rows cols options=3"],
+) -> Float[Tensor, "d_model"]:
+    """
+    Create the embedding of a board state according to the probe
+
+    Args:
+        world: the board state, with 0 for blank, +1 for mine, -1 for theirs
+        probe: directions in the residual stream that correspond to each square.
+            The last dimension is the options, with 0 for blank, 1 for mine, 2 for theirs
+    """
+
+    if isinstance(world, str):
+        world = board_to_tensor(world)
+
+    d_model = probe.shape[0]
+    blank_direction = probe[..., 0] - (probe[..., 1] + probe[..., 2]) / 2
+    my_direction = probe[..., 1] - probe[..., 2]
+
+    world = world.to(probe.device)
+    embedding = t.zeros(d_model, device=probe.device)
+    for row in range(world.shape[0]):
+        for col in range(world.shape[1]):
+            if world[row, col] == 0:
+                embedding += blank_direction[:, row, col]
+            else:
+                embedding += my_direction[:, row, col] * world[row, col]
+
+    return embedding
+
+
+# %%
+@t.inference_mode()
+def modify_resid_given_probe(
+    model: HookedTransformer,
+    moves_orig: Int[Tensor, "move"],
+    moves_new: Int[Tensor, "move"],
+    probe: Float[Tensor, "d_model rows cols options=3"],
+    layer: int = 6,
+):
+    act_name = utils.get_act_name("resid_pre", layer)
+    new_logits, new_cache = model.run_with_cache(
+        moves_new,
+        names_filter=lambda name: name == act_name,
+    )
+    print(*new_cache)
+
+    def hook(orig_activation: Float[Tensor, "game move d_model"], hook: HookPoint):
+        # Step 1. Remove the components that are in the space of the probe
+        # collect the probe vectors
+        probe_vectors = einops.rearrange(
+            probe,
+            "d_model rows cols options -> (options rows cols) d_model").to(orig_activation.device)
+        # normalize the probe vectors
+        probe_vectors = probe_vectors / probe_vectors.norm(dim=1, keepdim=True)
+        residual = orig_activation[:, -1]
+        # compute the coefficients of the probe vectors in the residual
+        coefficients = einops.einsum(residual, probe_vectors,
+                                     "game d_model, dir d_model -> game dir")
+        # remove the components of the probe vectors
+        residual -= einops.einsum(probe_vectors, coefficients,
+                                  "dir d_model, game dir -> game d_model")
+
+        # 2. Add the component of the from the new_cache
+        new_residual = new_cache[act_name][:, -1]
+        # compute the coefficients of the probe vectors in the new residual
+        coefficients = einops.einsum(new_residual, probe_vectors,
+                                     "game d_model, dir d_model -> game dir")
+        # and finally add the components in the direction of the probe vectors of the new residual
+        # into the residual
+        residual += einops.einsum(probe_vectors, coefficients,
+                                  "dir d_model, game dir -> game d_model")
+
+    patched_logits = model.run_with_hooks(
+        moves_orig,
+        fwd_hooks=[(act_name, hook)],
+    )
+
+    # display the logits
+    plot_square_as_board(logits_to_board(new_logits[0, -1], 'log_prob'),
+                         title="Model predictions (new)")
+    plot_square_as_board(logits_to_board(patched_logits[0, -1], 'log_prob'),
+                         title="Model predictions (patched)")
+
+
+orig_index = 0
+new_index = 1
+move_index = 20
+orig_games = focus_games_tokens[orig_index:orig_index+1, :move_index]
+new_games = focus_games_tokens[new_index:new_index+1, :move_index]
+modify_resid_given_probe(model, orig_games, new_games, linear_probe)
+
+# %%
+plot_single_board(focus_games_board_index[orig_index, :move_index], title="Original game")
+plot_single_board(focus_games_board_index[new_index, :move_index], title="New game")
 # %%
