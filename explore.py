@@ -29,8 +29,6 @@ from IPython.display import HTML, display
 from ipywidgets import interact
 from jaxtyping import Bool, Float, Int, jaxtyped
 from neel_plotly import line, scatter
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from rich import print as rprint
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -41,9 +39,14 @@ from transformer_lens.hook_points import HookedRootModule, HookPoint
 
 from plotly_utils import imshow
 
-from utils import get_othello_gpt, move_sequence_to_state
+from utils import *
 
-# %%
+try:
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import CSVLogger, WandbLogger
+except ValueError:
+    print("pytorch_lightning working")
+
 # %%
 t.set_grad_enabled(False)
 device = "cuda" if t.cuda.is_available() else "cpu"
@@ -52,34 +55,9 @@ device = "cuda" if t.cuda.is_available() else "cpu"
 cfg, model = get_othello_gpt(device)
 
 # %% Loading sample data
-full_games_tokens: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
-    OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"),
-                                                                   dtype=t.long)
-"""A tensor of shape `(num_games, length_of_game)` containing the board state at
-each move, as an integer from 0 to 60.  Suitable for input into the model.
-0 corresponds to 'pass' and is not used."""
-
-# Load board data as "strings" (i.e. 0 to 63 with middle squares skipped out)
-full_games_board_index: Int[Tensor, "games=100000 moves=60"] = t.tensor(np.load(
-    OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"),
-                                                                        dtype=t.long)
-"""A tensor of shape `(num_games, length_of_game)` containing the board state at
-each move, as an integer from 0 to 63 with the middle squares skipped out.
-Suitable for ???."""
-
-assert all([middle_sq not in full_games_board_index for middle_sq in [27, 28, 35, 36]])
-assert full_games_tokens.max() == 60
-assert full_games_tokens.min() == 1
-
-num_games, length_of_game = full_games_tokens.shape
-print("Number of games:", num_games)
-print("Length of game:", length_of_game)
-
-# %%
 
 num_games = 50
-focus_games_tokens = full_games_tokens[:num_games]
-focus_games_board_index = full_games_board_index[:num_games]
+focus_games_tokens, focus_games_board_index = utils.load_sample_games(num_games)
 
 focus_states = move_sequence_to_state(focus_games_board_index)
 focus_valid_moves = move_sequence_to_state(focus_games_board_index, mode="valid")
@@ -108,9 +86,21 @@ def get_loss(
     games_board_index: Int[Tensor, "batch game_len"],
     move_start: int = 5,
     move_end: int = -5,
-):
+) -> Float[Tensor, "2"]:
+    """Get the loss of the model on the given games.
+
+    Args:
+        model (HookedTransformer): the model to evaluate
+        games_token (Int[Tensor, "batch game_len rows cols"]): the tokenized games, integers between 0 and 60
+        games_board_index (Int[Tensor, "batch game_len"]): the board index of the games, integers between 0 and 64
+        move_start (int, optional): The first move to consider. Defaults to 5.
+        move_end (int, optional): The last move to consider. Defaults to -5.
+
+    Returns:
+        Float[Tensor, "2"]: the loss and accuracy of the model on the given games
+    """
     # This is the input to our model
-    assert isinstance(games_token, Int[Tensor, f"batch full_game_len=60"])
+    assert isinstance(games_token, Int[Tensor, "batch full_game_len=60"])
 
     valid_moves = move_sequence_to_state(games_board_index, only_valid=True)
     valid_moves = valid_moves[:, move_start:move_end].to(device)

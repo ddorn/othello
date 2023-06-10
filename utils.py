@@ -29,8 +29,6 @@ from IPython.display import HTML, display
 from ipywidgets import interact
 from jaxtyping import Bool, Float, Int, jaxtyped
 from neel_plotly import line, scatter
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from rich import print as rprint
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -77,6 +75,42 @@ def get_othello_gpt(device: str) -> Tuple[HookedTransformerConfig, HookedTransfo
     model.load_state_dict(sd)
 
     return cfg, model.to(device)
+
+
+def load_sample_games(max_games: int = 100_000,
+) -> Tuple[Int[Tensor, "games=100000 moves=60"], Int[Tensor, "games=100000 moves=60"]]:
+    """
+    Load a sample of games from the dataset.
+
+    Returns:
+        A tuple of `(full_games_tokens, full_games_board_index)`.
+        - full_games_tokens is a tensor of shape `(num_games, length_of_game)` containing the board state at
+          each move, as an integer from 0 to 60.  Suitable for input into the model.
+          0 corresponds to 'pass' and is not used.
+        - full_games_board_index is a tensor of shape `(num_games, length_of_game)` containing the board state at
+          each move, as an integer from 0 to 63 with the middle squares skipped out.
+
+
+    """
+    full_games_tokens = t.tensor(np.load(OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"),
+                                 dtype=t.long)
+    full_games_board_index = t.tensor(np.load(OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"),
+                                      dtype=t.long)
+
+    assert all([middle_sq not in full_games_board_index for middle_sq in [27, 28, 35, 36]])
+    assert full_games_tokens.max() == 60
+    assert full_games_tokens.min() == 1
+
+    num_games, length_of_game = full_games_tokens.shape
+    print("Number of games:", num_games)
+    print("Length of game:", length_of_game)
+
+    # We only want to use a subset of the games
+    # We'll use the first `max_games` games
+    full_games_tokens = full_games_tokens[:max_games]
+    full_games_board_index = full_games_board_index[:max_games]
+
+    return full_games_tokens, full_games_board_index
 
 
 # %%
