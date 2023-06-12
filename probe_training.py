@@ -31,8 +31,12 @@ from rich import print as rprint
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm.notebook import tqdm
-from transformer_lens import (ActivationCache, FactoredMatrix, HookedTransformer,
-                              HookedTransformerConfig)
+from transformer_lens import (
+    ActivationCache,
+    FactoredMatrix,
+    HookedTransformer,
+    HookedTransformerConfig,
+)
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
 from plotly_utils import imshow
@@ -45,7 +49,7 @@ try:
 except ValueError:
     print("pytorch_lightning working")
 
-PROBE_DIR = Path(__file__).parent / 'probes'
+PROBE_DIR = Path(__file__).parent / "probes"
 PROBE_DIR.mkdir(exist_ok=True)
 
 # %%
@@ -126,8 +130,12 @@ class ProbeTrainingArgs:
 class LitLinearProbe(pl.LightningModule):
     """A linear probe for a transformer with its training configured for pytorch-lightning."""
 
-    def __init__(self, model: HookedTransformer, args: ProbeTrainingArgs,
-                 *old_probes: Float[Tensor, "d_model rows cols options"]):
+    def __init__(
+        self,
+        model: HookedTransformer,
+        args: ProbeTrainingArgs,
+        *old_probes: Float[Tensor, "d_model rows cols options"],
+    ):
         super().__init__()
         self.model = model
         self.args = args
@@ -144,9 +152,11 @@ class LitLinearProbe(pl.LightningModule):
         pl.seed_everything(42, workers=True)
 
     # def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
-    def training_step(self, batch: Tuple[Int[Tensor, "game move"], Int[Tensor,
-                                                                       "game move row col"]],
-                      batch_idx: int) -> Float[Tensor, ""]:
+    def training_step(
+        self,
+        batch: Tuple[Int[Tensor, "game move"], Int[Tensor, "game move row col"]],
+        batch_idx: int,
+    ) -> Float[Tensor, ""]:
         """Return the loss for a batch."""
 
         game_len = self.args.length
@@ -191,11 +201,11 @@ class LitLinearProbe(pl.LightningModule):
 
         penalisation = t.tensor(0.0, device=self.model.cfg.device)
         for old_probe in self.old_probes:
-            cosine_sim_sq = einops.einsum(
+            cosine_sim_sq = (einops.einsum(
                 old_probe,
                 self.linear_probe / t.norm(self.linear_probe, dim=0),
                 "d_model row col option, d_model row col option -> row col option",
-            )**2
+            )**2)
             penalisation += cosine_sim_sq.mean()
         penalisation = penalisation * self.args.penalty_weight
 
@@ -224,10 +234,11 @@ class LitLinearProbe(pl.LightningModule):
 
         return data_loader
 
-    def validation_step(self, batch: Tuple[Int[Tensor, "game move"], Int[Tensor,
-                                                                         "game move row col"]],
-                        batch_idx: int) -> Float[Tensor, ""]:
-
+    def validation_step(
+        self,
+        batch: Tuple[Int[Tensor, "game move"], Int[Tensor, "game move row col"]],
+        batch_idx: int,
+    ) -> Float[Tensor, ""]:
         tokens, states = batch
 
         acc: Float[Tensor, "move option=3"]
@@ -237,7 +248,7 @@ class LitLinearProbe(pl.LightningModule):
             tokens,
             TOKENS_TO_BOARD.to(tokens.device)[tokens],
             per_option=True,
-            per_move='board_accuracy',
+            per_move="board_accuracy",
             plot=False,
         )
         acc_per_option = acc.mean(dim=0)
@@ -283,7 +294,7 @@ PROBE_PATHS = [FIRST_PROBE_PATH, SECOND_PROBE_PATH, THIRD_PROBE_PATH]
 
 def get_probe(n: int = 0,
               flip_mine: bool = False,
-              device='cpu') -> Float[Tensor, "d_model rows cols options"]:
+              device="cpu") -> Float[Tensor, "d_model rows cols options"]:
     """
     Load the probes that I trained.
 
@@ -312,11 +323,14 @@ def get_probe(n: int = 0,
     probe = t.load(path, map_location=device)
 
     if flip_mine:
-        probe = t.stack([
-            probe[..., 0],
-            probe[..., 2],
-            probe[..., 1],
-        ], dim=-1)
+        probe = t.stack(
+            [
+                probe[..., 0],
+                probe[..., 2],
+                probe[..., 1],
+            ],
+            dim=-1,
+        )
 
     return probe.to(device)
 
@@ -348,7 +362,7 @@ if TRAIN_FIRST_PROBE:
 
 TRAIN_ORTHINGAL_PROBE = False
 if TRAIN_ORTHINGAL_PROBE:
-    args = ProbeTrainingArgs(probe_name='orthogonal_probe')
+    args = ProbeTrainingArgs(probe_name="orthogonal_probe")
     lit_ortho_probe = LitLinearProbe(model, args, new_probe)
 
     logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)

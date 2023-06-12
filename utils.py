@@ -18,7 +18,7 @@ from IPython.display import display
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from tqdm.notebook import tqdm, trange
-from transformer_lens import (HookedTransformer, HookedTransformerConfig)
+from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
 from plotly_utils import imshow
@@ -32,7 +32,8 @@ OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
 if not OTHELLO_ROOT.exists():
     os.system("git clone https://github.com/likenneth/othello_world")
 
-from othello_world.mechanistic_interpretability.mech_interp_othello_utils import OthelloBoardState
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
+    OthelloBoardState, )
 
 # %%
 
@@ -73,7 +74,7 @@ def get_othello_gpt(device: str) -> Tuple[HookedTransformerConfig, HookedTransfo
     return cfg, model.to(device)
 
 
-def get_neels_probe(device='cpu') -> Float[Tensor, "d_model rows=8 cols=8 options=3"]:
+def get_neels_probe(device="cpu") -> Float[Tensor, "d_model rows=8 cols=8 options=3"]:
     """Returns the linear probe trained by Neel Nanda.
 
     The linear probe is a tensor of shape (d_model, rows, cols, options) where options are:
@@ -167,7 +168,7 @@ full_board_labels = list(map(to_board_label, range(64)))
 # %%
 def logits_to_board(
     logits: Float[Tensor, "... 61"],
-    mode: Literal['log_prob', 'prob', 'logits'],
+    mode: Literal["log_prob", "prob", "logits"],
 ) -> Float[Tensor, "... rows=8 cols=8"]:
     """Convert a set of logits into a board state, with each cell being a log prob of that cell being played."""
     if mode == "log_prob":
@@ -246,7 +247,10 @@ def move_sequence_to_state(
         stack = joblib.Parallel(n_jobs=-1)(
             joblib.delayed(move_sequence_to_state)(moves_board_index[i:i + 1000], mode=mode)
             for i in tqdm(
-                range(0, nb_games, 1000), desc="Converting moves to states", unit="1000 games"))
+                range(0, nb_games, 1000),
+                desc="Converting moves to states",
+                unit="1000 games",
+            ))
         return t.cat(stack, dim=0)
 
     if mode == "valid":
@@ -385,19 +389,19 @@ def get_loss(
     # This is the input to our model
     assert isinstance(games_token, Int[Tensor, "batch full_game_len=60"])
     # Compare the devices robustly
-    if games_token.device == t.device('cpu') and model.cfg.device != t.device('cpu'):
+    if games_token.device == t.device("cpu") and model.cfg.device != t.device("cpu"):
         print(
             f"Warning: games_token.device ({games_token.device}) != model.cfg.device ({model.cfg.device}). Moving to model.cfg.device."
         )
 
-    valid_moves = move_sequence_to_state(games_board_index, 'valid')
+    valid_moves = move_sequence_to_state(games_board_index, "valid")
     valid_moves = valid_moves[:, move_start:move_end].to(model.cfg.device)
     # print("valid moves:", valid_moves.shape)
     assert isinstance(valid_moves, Bool[Tensor, "batch game_len rows=8 cols=8"])
 
     logits = model(games_token[:, :move_end])[:, move_start:]
     # print("model output:", logits.shape)
-    log_probs = logits_to_board(logits, 'log_prob')
+    log_probs = logits_to_board(logits, "log_prob")
     # print("logit as board:", logits_as_board.shape)
 
     # Flatten the last 2 dimensions to have a 64-dim vector instead of 8x8
@@ -453,10 +457,10 @@ def plot_probe_accuracy(
     pos_end: int = -5,
     layer: int = 6,
     per_option: bool = False,
-    per_move: Literal['no', 'board_accuracy', 'cell_accuracy'] = 'no',
+    per_move: Literal["no", "board_accuracy", "cell_accuracy"] = "no",
     name: str = "probe",
     # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None,
-    prediction: Literal['argmax', 'softmax'] = 'argmax',
+    prediction: Literal["argmax", "softmax"] = "argmax",
     plot: bool = True,
 ) -> Float[Tensor, "rows cols *options"]:
     """
@@ -475,37 +479,42 @@ def plot_probe_accuracy(
         )
     resid = cache[act_name][:, pos_start:]  # We ignore the first moves here
     probe_out = einops.einsum(
-        resid, probe, "game move d_model, d_model row col options -> game move row col options")
+        resid,
+        probe,
+        "game move d_model, d_model row col options -> game move row col options",
+    )
 
     # Compute the expected states
-    states = move_sequence_to_state(game_board_index, 'alternate')[:, pos_start:pos_end]
+    states = move_sequence_to_state(game_board_index, "alternate")[:, pos_start:pos_end]
     states_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
-    states_one_hot: Bool[Tensor, 'game move row col options']
+    states_one_hot: Bool[Tensor, "game move row col options"]
 
     # Transform the probe output into a prediction
-    if prediction == 'argmax':
+    if prediction == "argmax":
         # The probe predict 100% on the option with the highest value, 0% on the others
         probe_values = probe_out.argmax(dim=-1, keepdim=True)
         probe_one_hot = t.zeros_like(probe_out)
         probe_one_hot.scatter_(-1, probe_values, 1)
         correct = (probe_one_hot == states_one_hot).float()
-    elif prediction == 'softmax':
+    elif prediction == "softmax":
         # The probe predict the probability of each option
         probs = probe_out.softmax(dim=-1)
         correct = t.zeros_like(probs)
         correct[states_one_hot] = probs[states_one_hot]
         correct[~states_one_hot] = 1 - probs[~states_one_hot]
 
-    correct: Float[Tensor, 'game move row col options']
+    correct: Float[Tensor, "game move row col options"]
 
     if False:
         # if options_stats is not None:
-        assert options_stats.shape[
-            0] == 3, f"options_stats should have 3 stats, got {options_stats.shape}"
+        assert (options_stats.shape[0] == 3
+                ), f"options_stats should have 3 stats, got {options_stats.shape}"
 
         # Compute weighted accuracy
-        weight = einops.rearrange(options_stats[:, pos_start:pos_end].to(model.cfg.device),
-                                  "stat move row col -> move row col stat")
+        weight = einops.rearrange(
+            options_stats[:, pos_start:pos_end].to(model.cfg.device),
+            "stat move row col -> move row col stat",
+        )
         coeff = 1 / weight
         coeff = coeff / coeff.sum(dim=-1, keepdim=True)
         # remove Nan
@@ -520,19 +529,19 @@ def plot_probe_accuracy(
         # We only keep the accuracy of the correct option
         kwargs = dict(
             facet_col=2,
-            facet_labels = ["Blank", "Mine", "Theirs"],
+            facet_labels=["Blank", "Mine", "Theirs"],
         )
     else:
         accuracy = accuracy * states_one_hot.float()
         accuracy = accuracy.sum(dim=-1)
         kwargs = {}
 
-    if per_move == 'board_accuracy':
+    if per_move == "board_accuracy":
         # Product over the row and col, mean over the games
         accuracy = accuracy.prod(3).prod(2)
         accuracy = accuracy.mean(dim=0)
         title = f"Board accuracy of {name}"
-    elif per_move == 'cell_accuracy':
+    elif per_move == "cell_accuracy":
         # Mean over games and cells
         accuracy = accuracy.mean(dim=(0, 2, 3))
         title = f"Cell accuracy of {name}"
@@ -543,7 +552,7 @@ def plot_probe_accuracy(
     if not plot:
         return accuracy
 
-    if per_move != 'no':
+    if per_move != "no":
         if accuracy.ndim == 1:
             # If 'board_accuracy' and not per_option
             accuracy = accuracy.unsqueeze(1)
@@ -564,14 +573,12 @@ def plot_probe_accuracy(
         fig.show()
 
     else:
-
         plot_square_as_board(
             1 - accuracy,
             title=f"Error rate of {name}",
             diverging_scale=False,
             **kwargs,
         )
-
 
     return accuracy
 
@@ -640,16 +647,18 @@ def zero_ablation(
 # %%
 
 
-def plot_similarities(vectors: Float[Tensor, '*n_vectors dim'], **kwargs):
+def plot_similarities(vectors: Float[Tensor, "*n_vectors dim"], **kwargs):
     """Plot the dot product between each pair of vectors"""
     vectors = vectors.flatten(end_dim=-2)
     sim = einops.einsum(vectors, vectors, "vec_1 dim, vec_2 dim -> vec_1 vec_2")
     imshow(sim, **kwargs)
 
 
-def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
-                        v2: Float[Tensor, '*n_vectors rows cols'],
-                        name: str = "vectors"):
+def plot_similarities_2(
+    v1: Float[Tensor, "*n_vectors rows cols"],
+    v2: Float[Tensor, "*n_vectors rows cols"],
+    name: str = "vectors",
+):
     """Plot the dot product between each pair of vectors"""
     if v1.ndim > 2:
         v1 = v1.flatten(end_dim=-3)
@@ -667,7 +676,7 @@ def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
 
 
 def generate_random_game(
-) -> Tuple[Int[Tensor, 'moves=60'], Bool[Tensor, 'moves=60 rows=8 cols=8']]:
+) -> (Tuple[Int[Tensor, "moves=60"], Bool[Tensor, "moves=60 rows=8 cols=8"]]):
     """Generate a random game of othello by choosing valid moves uniformly at random.
 
     Returns:
@@ -694,7 +703,7 @@ def generate_random_game(
 def generate_training_data(
     n: int = 100,
     seed: int = 42
-) -> Tuple[Int[Tensor, 'n_games moves=60'], Bool[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+) -> Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]:
     random.seed(seed)
     training_data = joblib.Parallel(n_jobs=-1)(joblib.delayed(generate_random_game)()
                                                for _ in trange(n))
@@ -713,7 +722,7 @@ GAME_VALID_MOVES_PATH = DATA_DIR / "games_valid_moves.pt"
 
 
 def make_training_data(
-) -> Tuple[Int[Tensor, 'n_games moves=60'], Bool[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+) -> (Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]):
     """Generate the training data and save it to disk.
 
     Returns:
@@ -738,7 +747,7 @@ def make_training_data(
 
 # %%
 def get_training_data(
-) -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+) -> (Tuple[Int[Tensor, "n_games moves=60"], Float[Tensor, "n_games moves=60 rows=8 cols=8"]]):
     """Load the training data.
 
     Returns:
@@ -753,9 +762,11 @@ def get_training_data(
 STATS_PATH = DATA_DIR / "stats.pt"
 
 
-def compute_stats(games_states: Int[Tensor, 'games moves rows cols'],
-                  games_valid_moves: Optional[Bool[Tensor, 'games moves rows cols']] = None,
-                  n_games: int = 0) -> Float[Tensor, 'stat cell row col']:
+def compute_stats(
+    games_states: Int[Tensor, "games moves rows cols"],
+    games_valid_moves: Optional[Bool[Tensor, "games moves rows cols"]] = None,
+    n_games: int = 0,
+) -> Float[Tensor, "stat cell row col"]:
     """Compute statistics about the training data
     Per move and per position:
     - Frequency of the cell being empty
@@ -773,9 +784,11 @@ def compute_stats(games_states: Int[Tensor, 'games moves rows cols'],
         games_valid_moves = [None] * n_games
 
     stats = t.zeros(n_stats, 60, 8, 8)
-    for board_states, valid_moves in tqdm(zip(games_states[:n_games], games_valid_moves[:n_games]),
-                                          desc="Computing stats",
-                                          total=n_games):
+    for board_states, valid_moves in tqdm(
+            zip(games_states[:n_games], games_valid_moves[:n_games]),
+            desc="Computing stats",
+            total=n_games,
+    ):
         game_stats = [
             board_states == 0,  # empty
             board_states == 1,  # my piece
@@ -797,7 +810,7 @@ def compute_stats(games_states: Int[Tensor, 'games moves rows cols'],
 
 
 # %%
-def valid_moves_from_board(board_state: Int[Tensor, 'row col'], move_index: int) -> List[int]:
+def valid_moves_from_board(board_state: Int[Tensor, "row col"], move_index: int) -> List[int]:
     """Get the valid moves from the board state at the given move index (to indicate the next player)
 
     move_index is 1-based, so 1 is the first move, 2 is the second move, etc.

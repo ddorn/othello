@@ -29,15 +29,20 @@ from torch import Tensor
 from torch.utils import data
 from torch.utils.data import DataLoader
 from tqdm.notebook import tqdm, trange
-from transformer_lens import (ActivationCache, FactoredMatrix, HookedTransformer,
-                              HookedTransformerConfig)
+from transformer_lens import (
+    ActivationCache,
+    FactoredMatrix,
+    HookedTransformer,
+    HookedTransformerConfig,
+)
 from transformer_lens.hook_points import HookedRootModule, HookPoint
 
 from plotly_utils import imshow
 
 from utils import *
 from probe_training import get_probe
-from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (plot_single_board)
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
+    plot_single_board, )
 
 try:
     import pytorch_lightning as pl
@@ -81,7 +86,7 @@ if SHOW_ATTENTION:
     game_idx = 0
     layer = 0
     labels = [to_board_label(focus_games_board_index[game_idx, i]) for i in range(59)]
-    attention_patterns(labels, focus_cache['pattern', layer][game_idx])
+    attention_patterns(labels, focus_cache["pattern", layer][game_idx])
 
 # %%
 RUN_ABLATIONS = False
@@ -139,8 +144,11 @@ if RUN_ABLATIONS:
         x=[f"≥ {i}" for i in range(model.cfg.n_layers)],
         facet_col=0,
         #  facet_col_wrap=3,
-        facet_labels=['Loss', 'Cell accuracy', 'Board accuracy'
-                      ],  # 'False Positive', 'False Negative', 'True Positive', 'True Negative'],
+        facet_labels=[
+            "Loss",
+            "Cell accuracy",
+            "Board accuracy",
+        ],  # 'False Positive', 'False Negative', 'True Positive', 'True Negative'],
         title="Metrics after zeroing all attention heads above a layer",
     )
 # %% Verify what happens when ablating every head
@@ -154,7 +162,7 @@ if RUN_ABLATIONS:
         # 2 and 15 because the same move was played in the 20th move
         # We check here that the model does the same on both (i.e. attention is not used)
         print(focus_games_tokens[game, :20])
-        plot_square_as_board(logits_to_board(logits[game, -1], 'log_prob'))
+        plot_square_as_board(logits_to_board(logits[game, -1], "log_prob"))
         plot_single_board(tokens_to_board(focus_games_tokens[game, :20]))
 
     assert t.allclose(logits[2, -1], logits[15, -1])
@@ -176,9 +184,9 @@ plot_probe_accuracy(
     focus_games_tokens,
     focus_games_board_index,
     # per_option=True,
-    per_move='board_accuracy',
+    per_move="board_accuracy",
     name="Neel's probe",
-);
+)
 
 # %%
 
@@ -202,7 +210,7 @@ if UMAP:
     vectors = einops.rearrange(linear_probe,
                                "d_model rows cols options -> (options rows cols) d_model")
 
-    mapper = umap.UMAP(metric='cosine').fit(vectors.cpu().numpy())
+    mapper = umap.UMAP(metric="cosine").fit(vectors.cpu().numpy())
 
     labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
     hover_data = pd.DataFrame({
@@ -211,7 +219,7 @@ if UMAP:
     })
 
     umap.plot.show_interactive(
-        umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
+        umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme="inferno"))
 
 # %%
 PLOT_PCAS = True
@@ -219,10 +227,12 @@ PLOT_PCAS = True
 PLOT_PCAS = False  # if false, disable all PCAs
 
 
-def plot_PCA(vectors: Float[Tensor, '*n_vectors dim'],
-             name: str = "",
-             absolute: bool = False,
-             flip_dim_order: bool = False):
+def plot_PCA(
+    vectors: Float[Tensor, "*n_vectors dim"],
+    name: str = "",
+    absolute: bool = False,
+    flip_dim_order: bool = False,
+):
     """Plot the PCA of the vectors
 
     Args:
@@ -254,9 +264,11 @@ def plot_PCA(vectors: Float[Tensor, '*n_vectors dim'],
         y = pca.explained_variance_ratio_
 
     display(
-        px.bar(x=range(len(pca.explained_variance_ratio_)),
-               y=y,
-               title=f"Explained variance ratio of the PCA on {name}"))
+        px.bar(
+            x=range(len(pca.explained_variance_ratio_)),
+            y=y,
+            title=f"Explained variance ratio of the PCA on {name}",
+        ))
 
     return pca
 
@@ -266,10 +278,12 @@ vectors = einops.rearrange(linear_probe, "d_model rows cols options -> (options 
 plot_PCA(vectors, "the probe vectors")
 # %% The same be per option
 for i in range(3):
-    plot_PCA(linear_probe[..., i],
-             f"the probe vectors for option {i}",
-             flip_dim_order=True,
-             absolute=True)
+    plot_PCA(
+        linear_probe[..., i],
+        f"the probe vectors for option {i}",
+        flip_dim_order=True,
+        absolute=True,
+    )
 
 # %% Normalise the probe then run PCA
 normalised_probe = linear_probe / linear_probe.norm(dim=-1, keepdim=True)
@@ -298,10 +312,7 @@ plot_PCA(my_direction.flatten(1).T, "the direction vectors")
 plot_PCA(blank_direction.flatten(1).T, "the direction vectors")
 
 # %% Probe exploration
-probes = [
-    get_probe(i, device=device)
-    for i in range(3)
-]
+probes = [get_probe(i, device=device) for i in range(3)]
 
 # %%
 plot_probe_accuracy(
@@ -310,18 +321,17 @@ plot_probe_accuracy(
     full_games_tokens[-100:],
     full_games_board_index[-100:],
     per_option=True,
-    per_move='board_accuracy',
+    per_move="board_accuracy",
     # per_move='cell_accuracy',
     name="neel's probe",
     # mode='softmax',
-);
+)
 
 # %%
 EXPLORE_PROBE = True
 
 if EXPLORE_PROBE:
-    for probe, name in zip(probes,
-                           ["new probe", "orthogonal probe", "orthogonal probe 2"]):
+    for probe, name in zip(probes, ["new probe", "orthogonal probe", "orthogonal probe 2"]):
         plot_probe_accuracy(
             model,
             probe.to(device),
@@ -442,7 +452,7 @@ osef_input = focus_games_tokens[:1, :20]  # 1 game, 20 moves
 logits = model.run_with_hooks(osef_input, fwd_hooks=[(act_name, hook)])
 
 # Plot what the model predicts
-logits = logits_to_board(logits[0, -1], 'log_prob')
+logits = logits_to_board(logits[0, -1], "log_prob")
 plot_square_as_board(logits, title="Model predictions")
 
 # %%
@@ -508,9 +518,9 @@ def modify_resid_given_probe(
     else:
         new_valid_moves = move_sequence_to_state(tokens_to_board(moves_new), mode="valid")
 
-    orig_logits = logits_to_board(model(moves_orig)[0, -1], 'log_prob')
-    patched_logits = logits_to_board(patched_logits[0, -1], 'log_prob')
-    new_logits = logits_to_board(new_logits[0, -1], 'log_prob')
+    orig_logits = logits_to_board(model(moves_orig)[0, -1], "log_prob")
+    patched_logits = logits_to_board(patched_logits[0, -1], "log_prob")
+    new_logits = logits_to_board(new_logits[0, -1], "log_prob")
 
     scale = new_logits.abs().max().cpu()
 
@@ -524,18 +534,20 @@ def modify_resid_given_probe(
     ]
 
     all_logits = t.stack([t.cpu() for t in to_stack], dim=-1)
-    plot_square_as_board(all_logits,
-                         title="Model predictions",
-                         facet_col=-1,
-                         facet_col_wrap=3,
-                         facet_labels=[
-                             'New expected',
-                             "new logits",
-                             'logit diff (patch - orig)',
-                             "original expected",
-                             'original logits',
-                             "patched logits",
-                         ])
+    plot_square_as_board(
+        all_logits,
+        title="Model predictions",
+        facet_col=-1,
+        facet_col_wrap=3,
+        facet_labels=[
+            "New expected",
+            "new logits",
+            "logit diff (patch - orig)",
+            "original expected",
+            "original logits",
+            "patched logits",
+        ],
+    )
 
     # plot_square_as_board(logits_to_board(new_logits[0, -1], 'log_prob'),
     #                      title="Model predictions (new)")
@@ -556,12 +568,7 @@ layer = 4
 orig_games = focus_games_tokens[orig_index:orig_index + 1, :move_index]
 new_games = focus_games_tokens[new_index:new_index + 1, :move_index]
 
-modify_resid_given_probe(model,
-                         orig_games,
-                         new_games,
-                         *probes,
-                         layer=layer,
-                         cells=['D2'])
+modify_resid_given_probe(model, orig_games, new_games, *probes, layer=layer, cells=["D2"])
 
 # %%
 plot_single_board(focus_games_board_index[orig_index, :move_index], title="Original game")
@@ -583,7 +590,6 @@ games_states = move_sequence_to_state(games_board_index, mode="alternate")
 valid_board_index, _ = generate_training_data(1_000, seed=69)
 valid_states = move_sequence_to_state(valid_board_index, mode="alternate")
 valid_tokens = BOARD_TO_TOKENS[valid_board_index]
-
 
 # %% Compute the game states
 
@@ -622,7 +628,6 @@ if 0:
 # %%
 from probe_training import ProbeTrainingArgs, LitLinearProbe, PROBE_DIR
 
-
 # %%
 wandb.finish()
 
@@ -639,7 +644,7 @@ for num_probe in range(3):
         valid_tokens=valid_tokens,
         valid_states=valid_states,
         correct_for_dataset_bias=False,
-        probe_name=f'orthogonal_probe_{num_probe}',
+        probe_name=f"orthogonal_probe_{num_probe}",
     )
     lit_ortho_probe = LitLinearProbe(model, args, *probes)
 
@@ -661,7 +666,7 @@ for num_probe in range(3):
         valid_tokens,
         valid_board_index,
         per_option=True,
-        per_move='board_accuracy',
+        per_move="board_accuracy",
     )
 
     wandb.finish()
