@@ -22,9 +22,6 @@ from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
 from plotly_utils import imshow
-import neel_plotly
-
-# %%
 
 OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
 OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
@@ -35,7 +32,17 @@ if not OTHELLO_ROOT.exists():
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
     OthelloBoardState, )
 
+# Conversion methods
+
 # %%
+TOKENS_TO_BOARD = t.tensor([-100] + [i for i in range(64) if i not in [27, 28, 35, 36]])
+BOARD_TO_TOKENS = t.zeros(64, dtype=t.long) - 100
+BOARD_TO_TOKENS[TOKENS_TO_BOARD[1:]] = t.arange(1, 61)
+
+
+def tokens_to_board(tokens):
+    """Map from token index (0 <= t < 60) to board index (0 < b < 64)"""
+    return TOKENS_TO_BOARD[tokens].to(tokens.device)
 
 
 def board_label_to_row_col(label: str) -> Tuple[int, int]:
@@ -46,6 +53,47 @@ def board_label_to_row_col(label: str) -> Tuple[int, int]:
     assert 0 <= row <= 7
     assert 0 <= col <= 7
     return row, col
+
+
+def to_board_label(board_index: int) -> str:
+    """Convert an index into a board label, e.g. `E2`. 0 ≤ i < 64"""
+    row = board_index // 8
+    col = board_index % 8
+    assert 0 <= row <= 7, f"Expected 0 ≤ row ≤ 7, got {row}"
+    assert 0 <= col <= 7, f"Expected 0 ≤ col ≤ 7, got {col}"
+    letter = "ABCDEFGH"[row]
+    return f"{letter}{col}"
+
+
+# Get our list of board labels
+board_labels = list(map(to_board_label, TOKENS_TO_BOARD[1:]))
+"""Map from token index to board label, e.g. `E2`. 0 ≤ i < 60"""
+full_board_labels = list(map(to_board_label, range(64)))
+"""Map from token index to board label, e.g. `E2`. 0 ≤ i < 64"""
+
+
+def logits_to_board(
+    logits: Float[Tensor, "... 61"],
+    mode: Literal["log_prob", "prob", "logits"],
+) -> Float[Tensor, "... rows=8 cols=8"]:
+    """Convert a set of logits into a board state, with each cell being a log prob of that cell being played."""
+    if mode == "log_prob":
+        x = logits.log_softmax(-1)
+    elif mode == "prob":
+        x = logits.softmax(-1)
+    elif mode == "logits":
+        x = logits
+    # Remove the "pass" move (the zeroth vocab item)
+    x = x[..., 1:]
+    assert x.shape[-1] == 60, f"Expected logits to have 60 items, got {x.shape[-1]}"
+
+    extra_shape = x.shape[:-1]
+    temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
+    temp_board_state[..., TOKENS_TO_BOARD] = x
+    # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
+    if mode == "log_prob":
+        temp_board_state[..., [27, 28, 35, 36]] = -13
+    return temp_board_state.reshape(*extra_shape, 8, 8)
 
 
 # %%
@@ -72,36 +120,6 @@ def get_othello_gpt(device: str) -> Tuple[HookedTransformerConfig, HookedTransfo
     model.load_state_dict(sd)
 
     return cfg, model.to(device)
-
-
-def get_neels_probe(device="cpu") -> Float[Tensor, "d_model rows=8 cols=8 options=3"]:
-    """Returns the linear probe trained by Neel Nanda.
-
-    The linear probe is a tensor of shape (d_model, rows, cols, options) where options are:
-    - 0: blank
-    - 1: my piece
-    - 2: their piece
-    """
-
-    full_linear_probe: Float[Tensor, "mode=3 d_model rows=8 cols=8 options=3"] = t.load(
-        OTHELLO_MECHINT_ROOT / "main_linear_probe.pth", map_location=device)
-
-    blank_index = 0
-    black_to_play_index = 1
-    white_to_play_index = 2
-    my_index = 1
-    their_index = 2
-    # (d_model, rows, cols, options)
-    linear_probe = t.zeros(512, 8, 8, 3, device=device)
-
-    linear_probe[..., blank_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 0] +
-                                            full_linear_probe[white_to_play_index, ..., 0])
-    linear_probe[..., their_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 1] +
-                                            full_linear_probe[white_to_play_index, ..., 2])
-    linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 2] +
-                                         full_linear_probe[white_to_play_index, ..., 1])
-
-    return linear_probe
 
 
 def load_sample_games(
@@ -139,73 +157,6 @@ def load_sample_games(
     full_games_board_index = full_games_board_index[:max_games]
 
     return full_games_tokens, full_games_board_index
-
-
-# %%
-TOKENS_TO_BOARD = t.tensor([i for i in range(64) if i not in [27, 28, 35, 36]])
-BOARD_TO_TOKENS = t.zeros(64, dtype=t.long)
-BOARD_TO_TOKENS[TOKENS_TO_BOARD] = t.arange(60)
-
-
-def tokens_to_board(tokens):
-    """Map from token index (0 <= t < 60) to board index (0 < b < 64)"""
-    return TOKENS_TO_BOARD[tokens - 1].to(tokens.device)
-
-
-def to_board_label(board_index: int) -> str:
-    """Convert an index into a board label, e.g. `E2`. 0 ≤ i < 64"""
-    letter = "ABCDEFGH"[board_index // 8]
-    return f"{letter}{board_index%8}"
-
-
-# Get our list of board labels
-board_labels = list(map(to_board_label, TOKENS_TO_BOARD))
-"""Map from token index to board label, e.g. `E2`. 0 ≤ i < 60"""
-full_board_labels = list(map(to_board_label, range(64)))
-"""Map from token index to board label, e.g. `E2`. 0 ≤ i < 64"""
-
-
-# %%
-def logits_to_board(
-    logits: Float[Tensor, "... 61"],
-    mode: Literal["log_prob", "prob", "logits"],
-) -> Float[Tensor, "... rows=8 cols=8"]:
-    """Convert a set of logits into a board state, with each cell being a log prob of that cell being played."""
-    if mode == "log_prob":
-        x = logits.log_softmax(-1)
-    elif mode == "prob":
-        x = logits.softmax(-1)
-    elif mode == "logits":
-        x = logits
-    # Remove the "pass" move (the zeroth vocab item)
-    x = x[..., 1:]
-    assert x.shape[-1] == 60, f"Expected logits to have 60 items, got {x.shape[-1]}"
-
-    extra_shape = x.shape[:-1]
-    temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
-    temp_board_state[..., TOKENS_TO_BOARD] = x
-    # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
-    if mode == "log_prob":
-        temp_board_state[..., [27, 28, 35, 36]] = -13
-    return temp_board_state.reshape(*extra_shape, 8, 8)
-
-
-# %%
-def plot_square_as_board(state: Float[Tensor, "... rows=8 cols=8"],
-                         diverging_scale: bool = True,
-                         **kwargs):
-    """Takes a square input (8 by 8) and plot it as a board. Can do a stack of boards via facet_col=0"""
-    kwargs = {
-        "y": list("ABCDEFGH"),
-        "x": [str(i) for i in range(8)],
-        # "color_continuous_scale": "plasma" if diverging_scale else "Blues",
-        "color_continuous_scale": "RdBu" if diverging_scale else "Blues",
-        "color_continuous_midpoint": 0.0 if diverging_scale else None,
-        "aspect": "equal",
-        **kwargs,
-    }
-    imshow(state, **kwargs)
-
 
 # %%
 def one_hot(list_of_ints: List[int], num_classes=64) -> Float[Tensor, "num_classes"]:
@@ -645,33 +596,6 @@ def zero_ablation(
 
 
 # %%
-
-
-def plot_similarities(vectors: Float[Tensor, "*n_vectors dim"], **kwargs):
-    """Plot the dot product between each pair of vectors"""
-    vectors = vectors.flatten(end_dim=-2)
-    sim = einops.einsum(vectors, vectors, "vec_1 dim, vec_2 dim -> vec_1 vec_2")
-    imshow(sim, **kwargs)
-
-
-def plot_similarities_2(
-    v1: Float[Tensor, "*n_vectors rows cols"],
-    v2: Float[Tensor, "*n_vectors rows cols"],
-    name: str = "vectors",
-):
-    """Plot the dot product between each pair of vectors"""
-    if v1.ndim > 2:
-        v1 = v1.flatten(end_dim=-3)
-    if v2.ndim > 2:
-        v2 = v2.flatten(end_dim=-3)
-    sim = einops.einsum(
-        v1 / t.norm(v1, dim=0),
-        v2 / t.norm(v2, dim=0),
-        "d_model rows cols, d_model rows cols -> rows cols",
-    )
-    plot_square_as_board(sim, title=f"Cosine similarity between {name}")
-
-
 # %%
 
 

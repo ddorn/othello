@@ -1,58 +1,115 @@
-# %%
 import os
 
 # os.environ["ACCELERATE_DISABLE_RICH"] = "1"
-import copy
-import dataclasses
-import itertools
-import random
-import sys
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Tuple
 
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from circuitsvis.attention import attention_patterns
 import einops
 import numpy as np
-import plotly.express as px
 import torch as t
 import torch.utils.data as data
-import transformer_lens
 import transformer_lens.utils as utils
 import wandb
-from IPython.display import HTML, display
-from ipywidgets import interact
-from jaxtyping import Bool, Float, Int, jaxtyped
-from neel_plotly import line, scatter
-from rich import print as rprint
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
-from transformer_lens import (
-    ActivationCache,
-    FactoredMatrix,
-    HookedTransformer,
-    HookedTransformerConfig,
-)
-from transformer_lens.hook_points import HookedRootModule, HookPoint
-
-from plotly_utils import imshow
+from transformer_lens import HookedTransformer
 
 from utils import *
 
 try:
-    import pytorch_lightning as pl
-    from pytorch_lightning.loggers import CSVLogger, WandbLogger
+    from pytorch_lightning import LightningModule
 except ValueError:
+    LightningModule = object
     print("pytorch_lightning working")
+
 
 PROBE_DIR = Path(__file__).parent / "probes"
 PROBE_DIR.mkdir(exist_ok=True)
 
-# %%
+
+def get_probe(n: int = 0,
+              flip_mine: bool = False,
+              device="cpu",
+              base_name='orthogonal_probe') -> Float[Tensor, "d_model rows cols options"]:
+    """
+    Load the probes that I trained.
+
+    Args:
+        n: The index of the probe to load. The n'th probe is orthogonal to all the previous ones.
+        flip_mine: Whether to flip the mine and opponent channels (useful to fix probes trained on the wrong player)
+        device: The device to load the probe onto.
+        base_name: The base name of the probe to load. The full name is PROBE_DIR/{base_name}_{n}.pt
+
+    Returns:
+        A probe with shape (d_model, rows, cols, options)
+        Options are:
+            0: Blank
+            1: Mine
+            2: Opponent
+    """
+
+    path = PROBE_DIR / f"{base_name}_{n}.pt"
+    if not path.exists():
+        valid_probes = list(PROBE_DIR.glob("orthogonal_probe_*.pt"))
+        if len(valid_probes) == 0:
+            raise FileNotFoundError(f"Could not find any probes in {PROBE_DIR}.")
+        raise FileNotFoundError(f"Could not find probe {n} in {PROBE_DIR}. "
+                                f"Valid probes are {valid_probes}.")
+
+    print(f"Loading probe from {path.resolve()}")
+    probe = t.load(path, map_location=device)
+
+    if flip_mine:
+        probe = t.stack(
+            [
+                probe[..., 0],
+                probe[..., 2],
+                probe[..., 1],
+            ],
+            dim=-1,
+        )
+
+    return probe.to(device)
+
+
+def get_neels_probe(merge_mine_theirs: bool = True,
+                    device="cpu") -> Float[Tensor, "d_model rows=8 cols=8 options=3"]:
+    """Returns the linear probe trained by Neel Nanda.
+
+    Args:
+        merge_mine_theirs: Whether to return the probe trained on mine and theirs separately.
+            If False, return the probe trained on every move.
+
+    Returns:
+        The linear probe is a tensor of shape (d_model, rows, cols, options) where options are:
+        - 0: blank
+        - 1: my piece
+        - 2: their piece
+    """
+
+    full_linear_probe: Float[Tensor, "mode=3 d_model rows=8 cols=8 options=3"] = t.load(
+        OTHELLO_MECHINT_ROOT / "main_linear_probe.pth", map_location=device)
+
+    blank_index = 0
+    black_to_play_index = 1
+    white_to_play_index = 2
+    my_index = 1
+    their_index = 2
+    # (d_model, rows, cols, options)
+    if merge_mine_theirs:
+        linear_probe = t.zeros(512, 8, 8, 3, device=device)
+
+        linear_probe[..., blank_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 0] +
+                                                full_linear_probe[white_to_play_index, ..., 0])
+        linear_probe[..., their_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 1] +
+                                                full_linear_probe[white_to_play_index, ..., 2])
+        linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 2] +
+                                            full_linear_probe[white_to_play_index, ..., 1])
+    else:
+        linear_probe = full_linear_probe[0]
+
+    return linear_probe
 
 
 @dataclass
@@ -127,7 +184,7 @@ class ProbeTrainingArgs:
         return self.pos_end - self.pos_start
 
 
-class LitLinearProbe(pl.LightningModule):
+class LitLinearProbe(LightningModule):
     """A linear probe for a transformer with its training configured for pytorch-lightning."""
 
     def __init__(
@@ -136,7 +193,13 @@ class LitLinearProbe(pl.LightningModule):
         args: ProbeTrainingArgs,
         *old_probes: Float[Tensor, "d_model rows cols options"],
     ):
+        assert LightningModule is not object, (
+            "pytorch_lightning is not working. "
+            "import it manually to see the error message."
+        )
+
         super().__init__()
+
         self.model = model
         self.args = args
         self.linear_probe = t.nn.Parameter(args.setup_linear_probe(model))
@@ -282,99 +345,3 @@ class LitLinearProbe(pl.LightningModule):
             betas=self.args.betas,
             weight_decay=self.args.wd,
         )
-
-
-# %%
-# Create the model & training system
-FIRST_PROBE_PATH = PROBE_DIR / f"main_linear_probe.pt"
-SECOND_PROBE_PATH = PROBE_DIR / f"orthogonal_probe.pt"
-THIRD_PROBE_PATH = PROBE_DIR / f"orthogonal_probe_2.pt"
-PROBE_PATHS = [FIRST_PROBE_PATH, SECOND_PROBE_PATH, THIRD_PROBE_PATH]
-
-
-def get_probe(n: int = 0,
-              flip_mine: bool = False,
-              device="cpu") -> Float[Tensor, "d_model rows cols options"]:
-    """
-    Load the probes that I trained.
-
-    Args:
-        n: The index of the probe to load. The n'th probe is orthogonal to all the previous ones.
-        flip_mine: Whether to flip the mine and opponent channels.
-        device: The device to load the probe onto.
-
-    Returns:
-        A probe with shape (d_model, rows, cols, options)
-        Options are:
-            0: Blank
-            1: Mine (or opponent if `flip_mine` is True)
-            2: Opponent (or mine if `flip_mine` is True)
-    """
-
-    path = PROBE_DIR / f"orthogonal_probe_{n}.pt"
-    if not path.exists():
-        valid_probes = list(PROBE_DIR.glob("orthogonal_probe_*.pt"))
-        if len(valid_probes) == 0:
-            raise FileNotFoundError(f"Could not find any probes in {PROBE_DIR}.")
-        raise FileNotFoundError(f"Could not find probe {n} in {PROBE_DIR}. "
-                                f"Valid probes are {valid_probes}.")
-
-    print(f"Loading probe from {path.resolve()}")
-    probe = t.load(path, map_location=device)
-
-    if flip_mine:
-        probe = t.stack(
-            [
-                probe[..., 0],
-                probe[..., 2],
-                probe[..., 1],
-            ],
-            dim=-1,
-        )
-
-    return probe.to(device)
-
-
-# %%
-
-TRAIN_FIRST_PROBE = False
-if TRAIN_FIRST_PROBE:
-    args = ProbeTrainingArgs()
-    litmodel = LitLinearProbe(model, args)
-
-    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-
-    # Train the model
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        logger=logger,
-        log_every_n_steps=1,
-    )
-    trainer.fit(model=litmodel)
-    wandb.finish()
-
-    new_probe = litmodel.linear_probe
-    if not FIRST_PROBE_PATH.exists():
-        t.save(new_probe, FIRST_PROBE_PATH)
-        print(f"Saved probe to {FIRST_PROBE_PATH.resolve()}")
-
-# %% Training an orthogonal probe
-
-TRAIN_ORTHINGAL_PROBE = False
-if TRAIN_ORTHINGAL_PROBE:
-    args = ProbeTrainingArgs(probe_name="orthogonal_probe")
-    lit_ortho_probe = LitLinearProbe(model, args, new_probe)
-
-    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-    trainer = pl.Trainer(
-        max_epochs=args.max_epochs,
-        logger=logger,
-        log_every_n_steps=1,
-    )
-    trainer.fit(model=lit_ortho_probe)
-    wandb.finish()
-
-    ortho_probe = lit_ortho_probe.linear_probe
-    if not SECOND_PROBE_PATH.exists():
-        t.save(ortho_probe, SECOND_PROBE_PATH)
-        print(f"Saved probe to {SECOND_PROBE_PATH.resolve()}")

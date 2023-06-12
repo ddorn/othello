@@ -5,42 +5,26 @@ os.environ["ACCELERATE_DISABLE_RICH"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-import itertools
-from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Tuple, Union
 
-import joblib
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 from circuitsvis.attention import attention_patterns
 import einops
-import numpy as np
-import plotly.express as px
 import torch as t
 import transformer_lens.utils as utils
 import wandb
-from IPython.display import HTML, display
-from jaxtyping import Bool, Float, Int, jaxtyped
-from neel_plotly import line, scatter
-from rich import print as rprint
+from jaxtyping import Float, Int
+from neel_plotly import line
 from torch import Tensor
-from torch.utils import data
-from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm, trange
 from transformer_lens import (
-    ActivationCache,
-    FactoredMatrix,
     HookedTransformer,
-    HookedTransformerConfig,
 )
-from transformer_lens.hook_points import HookedRootModule, HookPoint
+from transformer_lens.hook_points import HookPoint
 
 from plotly_utils import imshow
 
 from utils import *
-from probe_training import get_probe
+from probes import get_probe
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
     plot_single_board, )
 
@@ -51,25 +35,6 @@ except ValueError:
     print("pytorch_lightning working")
 
 #  %%
-t.set_grad_enabled(False)
-device = "cuda" if t.cuda.is_available() else "cpu"
-
-# %%
-cfg, model = get_othello_gpt(device)
-model = model.to(device)
-
-# %% Loading sample data
-full_games_tokens, full_games_board_index = load_sample_games()
-num_games = 50
-focus_games_tokens = full_games_tokens[:num_games]
-focus_games_board_index = full_games_board_index[:num_games]
-
-focus_states = move_sequence_to_state(focus_games_board_index)
-focus_valid_moves = move_sequence_to_state(focus_games_board_index, mode="valid")
-
-print("focus states:", focus_states.shape)
-print("focus_valid_moves", focus_valid_moves.shape)
-
 # %%
 # Zero ablation of every head and MLP
 # We try to see how much the overall loss of the model increases when ablating each component
@@ -89,228 +54,7 @@ if SHOW_ATTENTION:
     attention_patterns(labels, focus_cache["pattern", layer][game_idx])
 
 # %%
-RUN_ABLATIONS = False
-
-if RUN_ABLATIONS:
-    individual_heads = False
-    n_games = 50
-    tokens = full_games_tokens[-n_games:].to(device)
-    board_index = full_games_board_index[-n_games:].to(device)
-    get_metrics = lambda model: get_loss(model, tokens, board_index, 5, -5).to_tensor()
-    zero_ablation_metrics = zero_ablation(model, get_metrics, individual_heads).cpu()
-    base_metrics = get_metrics(model)
 # %%
-# Plotting the results
-if RUN_ABLATIONS:
-    x = [f"Head {i}" for i in range(model.cfg.n_heads)] + ["All Heads", "MLP"]
-    y = [f"Layer {i}" for i in range(model.cfg.n_layers)]
-    if not individual_heads:
-        x = x[-2:]
-
-    imshow(
-        zero_ablation_metrics[:3] - base_metrics[:3, None, None],
-        title="Metric increase after zeroing each component",
-        x=x,
-        y=y,
-        facet_col=0,
-        facet_labels=["Loss", "Cell accuracy", "Board accuracy"],
-    )
-
-# %% Are Attention heads even useful?
-
-# Abblate all attention after the layer `n`
-if RUN_ABLATIONS:
-
-    def filter(name: str, start_layer: int = 0):
-        if not name.startswith("blocks."):
-            # 'hook_embed' or 'hook_pos_embed' or 'ln_final.hook_scale' or 'ln_final.hook_normalized'
-            return False
-
-        layer = int(name.split(".")[1])
-
-        return layer >= start_layer and "attn_out" in name
-
-    metrics_per_layer = []
-    for start_layer in range(model.cfg.n_layers):
-        with model.hooks(fwd_hooks=[(partial(filter, start_layer=start_layer),
-                                     zero_ablation_hook)]):
-            metrics_per_layer.append(get_metrics(model))
-
-# %% Plot
-if RUN_ABLATIONS:
-    lines = t.stack(metrics_per_layer, dim=1).cpu()
-    line(
-        lines[:3],
-        x=[f"≥ {i}" for i in range(model.cfg.n_layers)],
-        facet_col=0,
-        #  facet_col_wrap=3,
-        facet_labels=[
-            "Loss",
-            "Cell accuracy",
-            "Board accuracy",
-        ],  # 'False Positive', 'False Negative', 'True Positive', 'True Negative'],
-        title="Metrics after zeroing all attention heads above a layer",
-    )
-# %% Verify what happens when ablating every head
-
-if RUN_ABLATIONS:
-    with model.hooks(fwd_hooks=[(lambda name: "attn_out" in name, zero_ablation_hook)]):
-        logits = model(focus_games_tokens[:, :20])
-
-    game = 1
-    for game in (game, ):
-        # 2 and 15 because the same move was played in the 20th move
-        # We check here that the model does the same on both (i.e. attention is not used)
-        print(focus_games_tokens[game, :20])
-        plot_square_as_board(logits_to_board(logits[game, -1], "log_prob"))
-        plot_single_board(tokens_to_board(focus_games_tokens[game, :20]))
-
-    assert t.allclose(logits[2, -1], logits[15, -1])
-
-# %%
-# Exploration of the probe
-
-linear_probe = get_neels_probe(device)
-"""Shape (d_model, rows, cols, options)
-options: 0: blank, 1: my piece, 2: their piece"""
-
-blank_probe, my_probe, their_probe = linear_probe.unbind(dim=-1)
-blank_direction = blank_probe - (their_probe + my_probe) / 2
-my_direction = my_probe - their_probe
-
-plot_probe_accuracy(
-    model,
-    linear_probe,
-    focus_games_tokens,
-    focus_games_board_index,
-    # per_option=True,
-    per_move="board_accuracy",
-    name="Neel's probe",
-)
-
-# %%
-
-# for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", "my"]):
-#     probe = einops.rearrange(probe, "d_model rows cols -> (rows cols) d_model")
-#     plot_similarities(probe,
-#                       title=f"Similarity between {name} vectors",
-#                       x=full_board_labels,
-#                       y=full_board_labels)
-
-# %% Similarity between mine and theirs (for each square)
-# plot_similarities_2(my_probe, their_probe)
-
-# %% UMAP on the vectors of the probe
-UMAP = False
-if UMAP:
-    import umap
-    import umap.plot
-    import pandas as pd
-
-    vectors = einops.rearrange(linear_probe,
-                               "d_model rows cols options -> (options rows cols) d_model")
-
-    mapper = umap.UMAP(metric="cosine").fit(vectors.cpu().numpy())
-
-    labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
-    hover_data = pd.DataFrame({
-        "square": full_board_labels * 3,
-        "probe": labels,
-    })
-
-    umap.plot.show_interactive(
-        umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme="inferno"))
-
-# %%
-PLOT_PCAS = True
-# %%
-PLOT_PCAS = False  # if false, disable all PCAs
-
-
-def plot_PCA(
-    vectors: Float[Tensor, "*n_vectors dim"],
-    name: str = "",
-    absolute: bool = False,
-    flip_dim_order: bool = False,
-):
-    """Plot the PCA of the vectors
-
-    Args:
-        vectors (Float[Tensor, "*n_vectors dim"): The vectors to do the PCA on
-        name (str, optional): The name for the plot.
-        absolute (bool, optional): If true, plots the explained variance instead of the ratio.
-        flip_dim_order (bool, optional): If true, the first dimension of the input is
-            the dimension of the vectors. Otherwise it is the last.
-    """
-    if not PLOT_PCAS:
-        return
-
-    if flip_dim_order:
-        vectors = einops.rearrange(vectors, "dim ... -> ... dim")
-
-    vectors = vectors.flatten(end_dim=-2)
-    vectors = StandardScaler(with_mean=False).fit_transform(vectors.cpu().numpy())
-    pca = PCA()
-    pca.fit(vectors)
-    # return px.bar(
-    #     x=range(1, len(pca.explained_variance_) + 1),
-    #     y=pca.explained_variance_,
-    #     title=f"PCA explained variance for {name}",
-    #     labels={"x": "Component", "y": "Log explained variance"},
-    # )
-    if absolute:
-        y = pca.explained_variance_
-    else:
-        y = pca.explained_variance_ratio_
-
-    display(
-        px.bar(
-            x=range(len(pca.explained_variance_ratio_)),
-            y=y,
-            title=f"Explained variance ratio of the PCA on {name}",
-        ))
-
-    return pca
-
-
-# %% Run PCA on the vectors of the probe
-vectors = einops.rearrange(linear_probe, "d_model rows cols options -> (options rows cols) d_model")
-plot_PCA(vectors, "the probe vectors")
-# %% The same be per option
-for i in range(3):
-    plot_PCA(
-        linear_probe[..., i],
-        f"the probe vectors for option {i}",
-        flip_dim_order=True,
-        absolute=True,
-    )
-
-# %% Normalise the probe then run PCA
-normalised_probe = linear_probe / linear_probe.norm(dim=-1, keepdim=True)
-plot_PCA(normalised_probe, "the normalised probe vectors", flip_dim_order=True)
-
-# %% Same PCA but with the unembeddings
-plot_PCA(model.W_U, "the unembeddings")
-
-# %%
-plot_PCA(model.W_pos, "the embeddings")
-# %%
-all_vectors = [
-    model.W_U.T,
-    model.W_E,
-    model.W_pos,
-    vectors,
-]
-all_vectors = [(v - v.mean(dim=0)) / v.std(dim=0) for v in all_vectors]
-
-plot_PCA(t.cat(all_vectors, dim=0), "the embeddings and unembeddings")
-# %%
-plot_PCA(t.cat([my_direction, blank_direction], dim=1).flatten(1).T, "the direction vectors")
-# %%
-plot_PCA(my_direction.flatten(1).T, "the direction vectors")
-# %%
-plot_PCA(blank_direction.flatten(1).T, "the direction vectors")
-
 # %% Probe exploration
 probes = [get_probe(i, device=device) for i in range(3)]
 
@@ -626,7 +370,7 @@ if 0:
     )
 
 # %%
-from probe_training import ProbeTrainingArgs, LitLinearProbe, PROBE_DIR
+from probes import ProbeTrainingArgs, LitLinearProbe, PROBE_DIR
 
 # %%
 wandb.finish()
