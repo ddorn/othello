@@ -2,9 +2,10 @@
 import os
 
 os.environ["ACCELERATE_DISABLE_RICH"] = "1"
+# os.environ["TORCH_USE_CUDA_DSA"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 import itertools
-import random
-import sys
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -18,17 +19,14 @@ import einops
 import numpy as np
 import plotly.express as px
 import torch as t
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import transformer_lens.utils as utils
 import wandb
 from IPython.display import HTML, display
-from ipywidgets import interact
 from jaxtyping import Bool, Float, Int, jaxtyped
 from neel_plotly import line, scatter
 from rich import print as rprint
 from torch import Tensor
+from torch.utils import data
 from torch.utils.data import DataLoader
 from tqdm.notebook import tqdm, trange
 from transformer_lens import (ActivationCache, FactoredMatrix, HookedTransformer,
@@ -39,6 +37,7 @@ from plotly_utils import imshow
 
 from utils import *
 from probe_training import get_probe
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (plot_single_board)
 
 try:
     import pytorch_lightning as pl
@@ -46,15 +45,15 @@ try:
 except ValueError:
     print("pytorch_lightning working")
 
-# %%
+#  %%
 t.set_grad_enabled(False)
 device = "cuda" if t.cuda.is_available() else "cpu"
 
 # %%
 cfg, model = get_othello_gpt(device)
+model = model.to(device)
 
 # %% Loading sample data
-full_games_tokens, full_games_board_index = load_sample_games()
 full_games_tokens, full_games_board_index = load_sample_games()
 num_games = 50
 focus_games_tokens = full_games_tokens[:num_games]
@@ -71,7 +70,7 @@ print("focus_valid_moves", focus_valid_moves.shape)
 # We try to see how much the overall loss of the model increases when ablating each component
 # First, we evalute the loss only on the focus games
 
-print(get_loss(model, focus_games_tokens, focus_games_board_index))
+# print(get_loss(model, focus_games_tokens, focus_games_board_index))
 # %%
 # Now, we find the loss but after ablating each head
 
@@ -85,10 +84,10 @@ if SHOW_ATTENTION:
     attention_patterns(labels, focus_cache['pattern', layer][game_idx])
 
 # %%
-RUN_ABLATIONS = True
+RUN_ABLATIONS = False
 
 if RUN_ABLATIONS:
-    individual_heads = True
+    individual_heads = False
     n_games = 50
     tokens = full_games_tokens[-n_games:].to(device)
     board_index = full_games_board_index[-n_games:].to(device)
@@ -145,21 +144,20 @@ if RUN_ABLATIONS:
         title="Metrics after zeroing all attention heads above a layer",
     )
 # %% Verify what happens when ablating every head
-with model.hooks(fwd_hooks=[(lambda name: "attn_out" in name, zero_ablation_hook)]):
-    logits = model(focus_games_tokens[:, :20])
 
-game = 1
-for game in (game, ):
-    # 2 and 15 because the same move was played in the 20th move
-    # We check here that the model does the same on both (i.e. attention is not used)
-    print(focus_games_tokens[game, :20])
-    plot_square_as_board(logits_to_board(logits[game, -1], 'log_prob'))
-    plot_single_board(tokens_to_board(focus_games_tokens[game, :20]))
+if RUN_ABLATIONS:
+    with model.hooks(fwd_hooks=[(lambda name: "attn_out" in name, zero_ablation_hook)]):
+        logits = model(focus_games_tokens[:, :20])
 
-assert t.allclose(logits[2, -1], logits[15, -1])
+    game = 1
+    for game in (game, ):
+        # 2 and 15 because the same move was played in the 20th move
+        # We check here that the model does the same on both (i.e. attention is not used)
+        print(focus_games_tokens[game, :20])
+        plot_square_as_board(logits_to_board(logits[game, -1], 'log_prob'))
+        plot_single_board(tokens_to_board(focus_games_tokens[game, :20]))
 
-# %%
-print(focus_games_tokens[:, 19])
+    assert t.allclose(logits[2, -1], logits[15, -1])
 
 # %%
 # Exploration of the probe
@@ -172,17 +170,27 @@ blank_probe, my_probe, their_probe = linear_probe.unbind(dim=-1)
 blank_direction = blank_probe - (their_probe + my_probe) / 2
 my_direction = my_probe - their_probe
 
+plot_probe_accuracy(
+    model,
+    linear_probe,
+    focus_games_tokens,
+    focus_games_board_index,
+    # per_option=True,
+    per_move='board_accuracy',
+    name="Neel's probe",
+);
+
 # %%
 
-for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", "my"]):
-    probe = einops.rearrange(probe, "d_model rows cols -> (rows cols) d_model")
-    plot_similarities(probe,
-                      title=f"Similarity between {name} vectors",
-                      x=full_board_labels,
-                      y=full_board_labels)
+# for probe, name in zip([blank_probe, their_probe, my_probe], ["blank", "their", "my"]):
+#     probe = einops.rearrange(probe, "d_model rows cols -> (rows cols) d_model")
+#     plot_similarities(probe,
+#                       title=f"Similarity between {name} vectors",
+#                       x=full_board_labels,
+#                       y=full_board_labels)
 
 # %% Similarity between mine and theirs (for each square)
-plot_similarities_2(my_probe, their_probe)
+# plot_similarities_2(my_probe, their_probe)
 
 # %% UMAP on the vectors of the probe
 UMAP = False
@@ -201,23 +209,14 @@ if UMAP:
         "square": full_board_labels * 3,
         "probe": labels,
     })
-    mapper = umap.UMAP(metric='cosine').fit(vectors.cpu().numpy())
 
-    labels = [probe_name for probe_name in ["blank", "their", "my"] for _ in full_board_labels]
-    hover_data = pd.DataFrame({
-        "square": full_board_labels * 3,
-        "probe": labels,
-    })
-
-    umap.plot.show_interactive(
-        umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
     umap.plot.show_interactive(
         umap.plot.interactive(mapper, labels=labels, hover_data=hover_data, theme='inferno'))
 
 # %%
 PLOT_PCAS = True
 # %%
-PLOT_PCAS = True  # if false, disable all PCAs
+PLOT_PCAS = False  # if false, disable all PCAs
 
 
 def plot_PCA(vectors: Float[Tensor, '*n_vectors dim'],
@@ -299,44 +298,45 @@ plot_PCA(my_direction.flatten(1).T, "the direction vectors")
 plot_PCA(blank_direction.flatten(1).T, "the direction vectors")
 
 # %% Probe exploration
-new_probe = get_probe(0, device=device)
-ortho_probe = get_probe(1, device=device)
+probes = [
+    get_probe(i, device=device)
+    for i in range(3)
+]
 
 # %%
-for probe, name in zip([new_probe, ortho_probe, ortho_probe_2],
-                       ["new probe", "orthogonal probe", "orthogonal probe 2"]):
-    plot_probe_accuracy(
-        model,
-        probe.to(device),
-        full_games_tokens[-100:],
-        full_games_board_index[-100:],
-        per_option=True,
-        name=name,
-    )
-
-# %%
-# the_probe = new_probe
-# the_probe = ortho_probe
-the_probe = ortho_probe_2
-# the_probe = linear_probe
 plot_probe_accuracy(
     model,
-    the_probe.to(device),
+    linear_probe,
     full_games_tokens[-100:],
     full_games_board_index[-100:],
     per_option=True,
-    name="orthogonal probe 2",
-)
+    per_move='board_accuracy',
+    # per_move='cell_accuracy',
+    name="neel's probe",
+    # mode='softmax',
+);
+
+# %%
+EXPLORE_PROBE = True
+
+if EXPLORE_PROBE:
+    for probe, name in zip(probes,
+                           ["new probe", "orthogonal probe", "orthogonal probe 2"]):
+        plot_probe_accuracy(
+            model,
+            probe.to(device),
+            full_games_tokens[-100:],
+            full_games_board_index[-100:],
+            per_option=True,
+            name=name,
+        )
 
 # %%
 
-plot_similarities_2(new_probe[..., 0], blank_probe, "New and old blank probe")
-plot_similarities_2(new_probe[..., 1], their_probe, "New and old mine probe")
-plot_similarities_2(new_probe[..., 2], my_probe, "New and old their probe")
-
-# %%
-for i in range(3):
-    plot_similarities_2(ortho_probe[..., i], linear_probe[..., i], f"Orthogonal and new probe {i}")
+if False:
+    plot_similarities_2(new_probe[..., 0], blank_probe, "New and old blank probe")
+    plot_similarities_2(new_probe[..., 1], their_probe, "New and old mine probe")
+    plot_similarities_2(new_probe[..., 2], my_probe, "New and old their probe")
 
 # %% Similarities between the blank probe and the token embeddings
 
@@ -427,8 +427,7 @@ board_3 = """
 
 board_tensor = board_to_tensor(board_3)
 resid = make_residual_stream(board_tensor, linear_probe)
-line(resid)
-plot_square_as_board(board_tensor)
+# plot_square_as_board(board_tensor)
 
 # %% Try to run the model on a virtual residual stream
 
@@ -448,51 +447,11 @@ plot_square_as_board(logits, title="Model predictions")
 
 # %%
 # Compute and show probe vector norms
-probe_norm = new_probe.norm(dim=0)
+# probe_norm = new_probe.norm(dim=0)
 # histogram
-px.histogram(probe_norm.cpu().flatten(), title="Probe vector norms", labels={"value": "norm"})
+# px.histogram(probe_norm.cpu().flatten(), title="Probe vector norms", labels={"value": "norm"})
 
 # %%
-
-
-# %%
-def swap_subspace(
-    original: Float[Tensor, "batch d_model"],
-    patch: Float[Tensor, "batch d_model"],
-    subspace: Float[Tensor, "... d_model"],
-    make_orthonormal_basis: bool = True,
-) -> Float[Tensor, "batch d_model"]:
-    """
-    Swap the subspace of the original with the subspace of the patch.
-
-    Args:
-        original: the original embedding
-        patch: the patch to apply
-        subspace: and orthonormal basis of the subspace to swap (except if make_orthogonal_basis is True)
-        make_orthonormal_basis: if True, the subspace is made orthonormal before being used.
-            This needs to be True if the subspace is not an orthonormal basis, or the result will be wrong.
-
-    Returns:
-        original ⊥ subspace + (patch - (patch ⊥ subspace))
-    """
-
-    # Step 0. Find a basis of the subspace of the probe
-    subspace = subspace.flatten(end_dim=-2)
-    if make_orthonormal_basis:
-        # normalize the vectors
-        subspace = subspace / subspace.norm(dim=-1, keepdim=True)
-        # Find the basis using SVD
-        _, _, subspace = t.linalg.svd(subspace, full_matrices=False)
-
-    # Step 1. Remove the components that are in the space of the probe
-    coefficients = einops.einsum(original, subspace, "batch d_model, dir d_model -> batch dir")
-    original = original - einops.einsum(coefficients, subspace,
-                                        "batch dir, dir d_model -> batch d_model")
-
-    # 2. Add the component of the from the new_cache
-    coefficients = einops.einsum(patch, subspace, "batch d_model, dir d_model -> batch dir")
-    return original + einops.einsum(subspace, coefficients,
-                                    "dir d_model, batch dir -> batch d_model")
 
 
 @t.inference_mode()
@@ -600,76 +559,36 @@ new_games = focus_games_tokens[new_index:new_index + 1, :move_index]
 modify_resid_given_probe(model,
                          orig_games,
                          new_games,
-                         new_probe,
-                         ortho_probe,
+                         *probes,
                          layer=layer,
                          cells=['D2'])
 
 # %%
 plot_single_board(focus_games_board_index[orig_index, :move_index], title="Original game")
-
-# plot_single_board(focus_games_board_index[new_index, :move_index], title="New game")
-
+plot_single_board(focus_games_board_index[new_index, :move_index], title="New game")
 
 # %%
-def valid_moves_from_board(board_state: Int[Tensor, 'row col'], move_index: int) -> List[int]:
-    """Get the valid moves from the board state at the given move index (to indicate the next player)
-
-    move_index is 1-based, so 1 is the first move, 2 is the second move, etc.
-    It corresponds to the number of moves that have been played (same as game[:move_index])
-    """
-    # np_board_state = move_sequence_to_state(tokens_to_board(orig_games), mode="normal")[0, -1].numpy()
-    # print(np_board_state)
-    state = OthelloBoardState()
-    state.state = utils.to_numpy(board_state)
-    # -1 or -1. First move is +1
-    state.next_hand_color = ((move_index + 1) % 2) * 2 - 1
-    return state.get_valid_moves()
-
-
-# %%
-
-np_board_state = move_sequence_to_state(tokens_to_board(orig_games), mode="valid")[0, -1].numpy()
-np_board_state
-# %%
-from probe_training import ProbeTrainingArgs, LitLinearProbe, PROBE_DIR
-
-# %%
-wandb.finish()
-
-args = ProbeTrainingArgs(train_tokens=full_games_tokens,
-                         train_board_indices=full_games_board_index,
-                         probe_name='orthogonal_probe')
-lit_ortho_probe = LitLinearProbe(model, args, new_probe, ortho_probe)
-
-logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
-trainer = pl.Trainer(
-    max_epochs=args.max_epochs,
-    logger=logger,
-    log_every_n_steps=1,
-)
-trainer.fit(model=lit_ortho_probe)
-wandb.finish()
-
-ortho_probe_2 = lit_ortho_probe.linear_probe
-path = PROBE_DIR / "orthogonal_probe_2.pt"
-if not path.exists():
-    t.save(ortho_probe, path)
-    print(f"Saved probe to {path.resolve()}")
-else:
-    print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
 
 # %%
 MAKE_NEW_TRAINING_DATA = False
 if MAKE_NEW_TRAINING_DATA:
-    games_tokens, games_valid_moves = make_training_data()
+    games_board_index, games_valid_moves = make_training_data()
 else:
-    games_tokens, games_valid_moves = get_training_data()
+    games_board_index, games_valid_moves = get_training_data()
+
+games_tokens = BOARD_TO_TOKENS[games_board_index]
+games_states = move_sequence_to_state(games_board_index, mode="alternate")
+
+# %%
+valid_board_index, _ = generate_training_data(1_000, seed=69)
+valid_states = move_sequence_to_state(valid_board_index, mode="alternate")
+valid_tokens = BOARD_TO_TOKENS[valid_board_index]
+
 
 # %% Compute the game states
+
 COMPUTE_STATS = False
 if COMPUTE_STATS:
-    games_states = move_sequence_to_state(games_tokens, mode="alternate")
     compute_stats(games_states, games_valid_moves)
 else:
     stats = t.load(STATS_PATH)
@@ -686,17 +605,72 @@ plot_square_as_board(
 )
 
 # %% Plot stats per cell and move
-moves_to_show = [0, 5, 10, 20, 30, 40, 50, 55]
-x = einops.rearrange(stats[:, moves_to_show], "option m r c -> (m option) r c")
-labels = [f"{name} (move {move})" for move in moves_to_show for name in stat_names]
+if 0:
+    moves_to_show = [0, 5, 10, 20, 30, 40, 50, 55]
+    x = einops.rearrange(stats[:, moves_to_show], "option m r c -> (m option) r c")
+    labels = [f"{name} (move {move})" for move in moves_to_show for name in stat_names]
 
-plot_square_as_board(
-    x,
-    facet_col=0,
-    facet_col_wrap=4,
-    facet_labels=labels,
-    title="Average frequency of each cell being ...",
-    height=3000,
-)
+    plot_square_as_board(
+        x,
+        facet_col=0,
+        facet_col_wrap=4,
+        facet_labels=labels,
+        title="Average frequency of each cell being ...",
+        height=3000,
+    )
+
+# %%
+from probe_training import ProbeTrainingArgs, LitLinearProbe, PROBE_DIR
+
+
+# %%
+wandb.finish()
+
+# %%
+probes = []
+
+for num_probe in range(3):
+    args = ProbeTrainingArgs(
+        lr=1e-3,
+        max_epochs=4,
+        wd=0.05,
+        train_tokens=games_tokens,
+        train_states=games_states,
+        valid_tokens=valid_tokens,
+        valid_states=valid_states,
+        correct_for_dataset_bias=False,
+        probe_name=f'orthogonal_probe_{num_probe}',
+    )
+    lit_ortho_probe = LitLinearProbe(model, args, *probes)
+
+    logger = WandbLogger(save_dir=os.getcwd() + "/logs", project=args.probe_name)
+    trainer = pl.Trainer(
+        max_epochs=args.max_epochs,
+        logger=logger,
+        log_every_n_steps=1,
+        val_check_interval=100,
+        check_val_every_n_epoch=None,
+    )
+
+    trainer.fit(model=lit_ortho_probe)
+    probes.append(lit_ortho_probe.linear_probe)
+    model = model.to(device)  # pl trainer moves model to cpu at the end :shrug:
+    plot_probe_accuracy(
+        model,
+        lit_ortho_probe.linear_probe,
+        valid_tokens,
+        valid_board_index,
+        per_option=True,
+        per_move='board_accuracy',
+    )
+
+    wandb.finish()
+
+    path = PROBE_DIR / f"orthogonal_probe_{num_probe}.pt"
+    if not path.exists():
+        t.save(lit_ortho_probe.linear_probe, path)
+        print(f"Saved probe to {path.resolve()}")
+    else:
+        print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
 
 # %%

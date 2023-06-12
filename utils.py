@@ -1,43 +1,28 @@
 # %%
 import os
-
-# os.environ["ACCELERATE_DISABLE_RICH"] = "1"
-import copy
-import dataclasses
-import itertools
 import random
-import sys
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Tuple, Union
+import joblib
 
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from circuitsvis.attention import attention_patterns
+import plotly.express as px
+import plotly.graph_objects as go
 import einops
 import numpy as np
-import plotly.express as px
 import torch as t
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import transformer_lens
 import transformer_lens.utils as utils
-import wandb
-from IPython.display import HTML, display
-from ipywidgets import interact
-from jaxtyping import Bool, Float, Int, jaxtyped
-from neel_plotly import line, scatter
-from rich import print as rprint
+from IPython.display import display
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
-from transformer_lens import (ActivationCache, FactoredMatrix, HookedTransformer,
-                              HookedTransformerConfig)
-from transformer_lens.hook_points import HookedRootModule, HookPoint
+from tqdm.notebook import tqdm, trange
+from transformer_lens import (HookedTransformer, HookedTransformerConfig)
+from transformer_lens.hook_points import HookPoint
 
 from plotly_utils import imshow
+import neel_plotly
 
 # %%
 
@@ -47,7 +32,7 @@ OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
 if not OTHELLO_ROOT.exists():
     os.system("git clone https://github.com/likenneth/othello_world")
 
-from othello_world.mechanistic_interpretability.mech_interp_othello_utils import OthelloBoardState, plot_single_board, plot_board_log_probs
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import OthelloBoardState
 
 # %%
 
@@ -60,6 +45,7 @@ def board_label_to_row_col(label: str) -> Tuple[int, int]:
     assert 0 <= row <= 7
     assert 0 <= col <= 7
     return row, col
+
 
 # %%
 
@@ -156,6 +142,8 @@ def load_sample_games(
 
 # %%
 TOKENS_TO_BOARD = t.tensor([i for i in range(64) if i not in [27, 28, 35, 36]])
+BOARD_TO_TOKENS = t.zeros(64, dtype=t.long)
+BOARD_TO_TOKENS[TOKENS_TO_BOARD] = t.arange(60)
 
 
 def tokens_to_board(tokens):
@@ -170,7 +158,6 @@ def to_board_label(board_index: int) -> str:
 
 
 # Get our list of board labels
-board_labels = list(map(to_board_label, TOKENS_TO_BOARD))
 board_labels = list(map(to_board_label, TOKENS_TO_BOARD))
 """Map from token index to board label, e.g. `E2`. 0 ≤ i < 60"""
 full_board_labels = list(map(to_board_label, range(64)))
@@ -196,12 +183,7 @@ def logits_to_board(
     extra_shape = x.shape[:-1]
     temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
     temp_board_state[..., TOKENS_TO_BOARD] = x
-    extra_shape = x.shape[:-1]
-    temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
-    temp_board_state[..., TOKENS_TO_BOARD] = x
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
-    if mode == "log_prob":
-        temp_board_state[..., [27, 28, 35, 36]] = -13
     if mode == "log_prob":
         temp_board_state[..., [27, 28, 35, 36]] = -13
     return temp_board_state.reshape(*extra_shape, 8, 8)
@@ -259,17 +241,32 @@ def move_sequence_to_state(
     """
     assert len(moves_board_index.shape) == 2
 
-    states = t.zeros((*moves_board_index.shape, 8, 8), dtype=t.float32)
-    if moves_board_index.shape[0] > 999:
+    nb_games = moves_board_index.shape[0]
+    if nb_games > 10_000:
+        stack = joblib.Parallel(n_jobs=-1)(
+            joblib.delayed(move_sequence_to_state)(moves_board_index[i:i + 1000], mode=mode)
+            for i in tqdm(
+                range(0, nb_games, 1000), desc="Converting moves to states", unit="1000 games"))
+        return t.cat(stack, dim=0)
+
+    if mode == "valid":
+        dtype = t.bool
+    else:
+        dtype = t.float32
+
+    states = t.zeros((*moves_board_index.shape, 8, 8), dtype=dtype)
+
+    if nb_games > 1_000:
         iterator = tqdm(moves_board_index, desc="Converting moves to states")
     else:
         iterator = moves_board_index
+
     for b, moves in enumerate(iterator):
         board = OthelloBoardState()
         for m, move in enumerate(moves):
             board.umpire(move.item())
             if mode == "valid":
-                states[b, m] = one_hot(board.get_valid_moves()).reshape(8, 8)
+                states[b, m].flatten()[board.get_valid_moves()] = True
             else:
                 states[b, m] = t.tensor(board.state)
 
@@ -281,7 +278,7 @@ def move_sequence_to_state(
 # %%
 def state_stack_to_one_hot(
     state_stack: Float[Tensor, "games moves rows=8 cols=8"]
-) -> Int[Tensor, "games moves rows=8 cols=8 options=3"]:
+) -> Bool[Tensor, "games moves rows=8 cols=8 options=3"]:
     """
     Creates a tensor of shape (games, moves, rows=8, cols=8, options=3), where the [g, m, r, c, :]-th entry
     is a one-hot encoded vector for the state of game g at move m, at row r and column c. In other words, this
@@ -297,7 +294,7 @@ def state_stack_to_one_hot(
         8,
         3,  # the options: empty, white, or black
         device=state_stack.device,
-        dtype=t.int,
+        dtype=t.bool,
     )
     one_hot[..., 0] = state_stack == 0
     one_hot[..., 1] = state_stack == -1
@@ -396,7 +393,7 @@ def get_loss(
     valid_moves = move_sequence_to_state(games_board_index, 'valid')
     valid_moves = valid_moves[:, move_start:move_end].to(model.cfg.device)
     # print("valid moves:", valid_moves.shape)
-    assert isinstance(valid_moves, Float[Tensor, f"batch game_len rows=8 cols=8"])
+    assert isinstance(valid_moves, Bool[Tensor, "batch game_len rows=8 cols=8"])
 
     logits = model(games_token[:, :move_end])[:, move_start:]
     # print("model output:", logits.shape)
@@ -413,7 +410,7 @@ def get_loss(
         "batch move row col -> batch move (row col)",
     )
 
-    loss = F.kl_div(log_probs, valid_moves)
+    loss = F.kl_div(log_probs, valid_moves.float())
     # loss = log_probs * valid_moves
     # print("loss:", loss.shape, loss)
     # loss = -loss.sum(dim=-1).mean()
@@ -456,54 +453,125 @@ def plot_probe_accuracy(
     pos_end: int = -5,
     layer: int = 6,
     per_option: bool = False,
-    name: str = "",
+    per_move: Literal['no', 'board_accuracy', 'cell_accuracy'] = 'no',
+    name: str = "probe",
+    # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None,
+    prediction: Literal['argmax', 'softmax'] = 'argmax',
+    plot: bool = True,
 ) -> Float[Tensor, "rows cols *options"]:
     """
     Compute and plot the accuracy of the probe at each position of the board.
+
+    If options_stats is provided, it will be used to compute the weighted accuracy instead.
     """
     pos_end = pos_end % game_tokens.shape[1]  # making sure it's positive
 
-    states = move_sequence_to_state(game_board_index)
-    flipped_states = alternate_states(states)[:, pos_start:pos_end]
-
+    # Compute the probe output
     act_name = utils.get_act_name("resid_post", layer)
     with t.inference_mode():
         _, cache = model.run_with_cache(
             game_tokens[:, :pos_end].to(model.cfg.device),  # We ignore the last moves here
             names_filter=lambda name: name == act_name,
         )
-
     resid = cache[act_name][:, pos_start:]  # We ignore the first moves here
     probe_out = einops.einsum(
         resid, probe, "game move d_model, d_model row col options -> game move row col options")
-    probe_out_value = probe_out.argmax(dim=-1).cpu()
 
-    if not per_option:
-        probe_out_value[probe_out_value == 2] = -1
+    # Compute the expected states
+    states = move_sequence_to_state(game_board_index, 'alternate')[:, pos_start:pos_end]
+    states_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
+    states_one_hot: Bool[Tensor, 'game move row col options']
 
-        correct_answers = probe_out_value == flipped_states
-        accuracy = einops.reduce(correct_answers.float(), "game move row col -> row col", "mean")
+    # Transform the probe output into a prediction
+    if prediction == 'argmax':
+        # The probe predict 100% on the option with the highest value, 0% on the others
+        probe_values = probe_out.argmax(dim=-1, keepdim=True)
+        probe_one_hot = t.zeros_like(probe_out)
+        probe_one_hot.scatter_(-1, probe_values, 1)
+        correct = (probe_one_hot == states_one_hot).float()
+    elif prediction == 'softmax':
+        # The probe predict the probability of each option
+        probs = probe_out.softmax(dim=-1)
+        correct = t.zeros_like(probs)
+        correct[states_one_hot] = probs[states_one_hot]
+        correct[~states_one_hot] = 1 - probs[~states_one_hot]
 
-        display(plot_square_as_board(
+    correct: Float[Tensor, 'game move row col options']
+
+    if False:
+        # if options_stats is not None:
+        assert options_stats.shape[
+            0] == 3, f"options_stats should have 3 stats, got {options_stats.shape}"
+
+        # Compute weighted accuracy
+        weight = einops.rearrange(options_stats[:, pos_start:pos_end].to(model.cfg.device),
+                                  "stat move row col -> move row col stat")
+        coeff = 1 / weight
+        coeff = coeff / coeff.sum(dim=-1, keepdim=True)
+        # remove Nan
+        coeff[~t.isfinite(coeff)] = 1
+        accuracy = correct * coeff
+    else:
+        accuracy = correct
+
+    accuracy: Float[Tensor, "game move row col options"]
+
+    if per_option:
+        # We only keep the accuracy of the correct option
+        kwargs = dict(
+            facet_col=2,
+            facet_labels = ["Blank", "Mine", "Theirs"],
+        )
+    else:
+        accuracy = accuracy * states_one_hot.float()
+        accuracy = accuracy.sum(dim=-1)
+        kwargs = {}
+
+    if per_move == 'board_accuracy':
+        # Product over the row and col, mean over the games
+        accuracy = accuracy.prod(3).prod(2)
+        accuracy = accuracy.mean(dim=0)
+        title = f"Board accuracy of {name}"
+    elif per_move == 'cell_accuracy':
+        # Mean over games and cells
+        accuracy = accuracy.mean(dim=(0, 2, 3))
+        title = f"Cell accuracy of {name}"
+    else:
+        # Mean over games and moves
+        accuracy = accuracy.mean(dim=(0, 1))
+
+    if not plot:
+        return accuracy
+
+    if per_move != 'no':
+        if accuracy.ndim == 1:
+            # If 'board_accuracy' and not per_option
+            accuracy = accuracy.unsqueeze(1)
+        labels = kwargs.get("facet_labels", ["All combined"])
+        fig = go.Figure()
+        for line, label in zip(accuracy.T, labels):
+            fig.add_trace(go.Scatter(
+                x=t.arange(pos_start, pos_end),
+                y=line.cpu(),
+                name=label,
+            ))
+        fig.update_layout(
+            title=title,
+            xaxis_title="Move",
+            yaxis_title="Accuracy",
+            legend_title="Option",
+        )
+        fig.show()
+
+    else:
+
+        plot_square_as_board(
             1 - accuracy,
             title=f"Error rate of {name}",
-        ))
-    else:
-        correct_blank = (probe_out_value == 0) == (flipped_states == 0)
-        correct_mine = (probe_out_value == 2) == (flipped_states == 1)
-        correct_theirs = (probe_out_value == 1) == (flipped_states == -1)
+            diverging_scale=False,
+            **kwargs,
+        )
 
-        correct = t.stack([correct_blank, correct_mine, correct_theirs], dim=-1)
-        accuracy = einops.reduce(correct.float(), "game move row col option -> row col option",
-                                 "mean")
-
-        display(
-            plot_square_as_board(
-                1 - accuracy,
-                title=f"Error rate of {name}",
-                facet_col=2,
-                facet_labels=["Blank", "Mine", "Theirs"],
-            ))
 
     return accuracy
 
@@ -594,9 +662,12 @@ def plot_similarities_2(v1: Float[Tensor, '*n_vectors rows cols'],
     )
     plot_square_as_board(sim, title=f"Cosine similarity between {name}")
 
+
 # %%
 
-def generate_random_game() -> Tuple[Int[Tensor, 'moves=60'], Float[Tensor, 'moves=60 rows=8 cols=8']]:
+
+def generate_random_game(
+) -> Tuple[Int[Tensor, 'moves=60'], Bool[Tensor, 'moves=60 rows=8 cols=8']]:
     """Generate a random game of othello by choosing valid moves uniformly at random.
 
     Returns:
@@ -605,30 +676,34 @@ def generate_random_game() -> Tuple[Int[Tensor, 'moves=60'], Float[Tensor, 'move
     """
     state = OthelloBoardState()
     moves = []
-    valid_moves = []
-    while True:
+    valid_moves = t.zeros(60, 64, dtype=t.bool)
+    for i in range(60):
         possible = state.get_valid_moves()
-        if not possible:
-            break
-        valid_moves.append(one_hot(possible).reshape(8, 8))
+
+        if not possible:  # no valid move before a game of length 60
+            return generate_random_game()
+
+        valid_moves[i, possible] = True
         move = random.choice(possible)
         moves.append(move)
         state.umpire(move)
 
-    if len(moves) != 60:
-        return generate_random_game()
-    return t.tensor(moves), t.stack(valid_moves)
+    return t.tensor(moves), valid_moves.reshape(60, 8, 8)
 
-def generate_training_data(n: int = 100, seed: int = 42):
-    training_data = joblib.Parallel(n_jobs=-1)(
-        joblib.delayed(generate_random_game)()
-        for _ in trange(100_000)
-    )
 
-    games_tokens = t.stack([game for game, _ in training_data])
+def generate_training_data(
+    n: int = 100,
+    seed: int = 42
+) -> Tuple[Int[Tensor, 'n_games moves=60'], Bool[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+    random.seed(seed)
+    training_data = joblib.Parallel(n_jobs=-1)(joblib.delayed(generate_random_game)()
+                                               for _ in trange(n))
+
+    games_board_index = t.stack([game for game, _ in training_data])
     games_valid_moves = t.stack([valid_moves for _, valid_moves in training_data])
 
-    return games_tokens, games_valid_moves
+    return games_board_index, games_valid_moves
+
 
 # %% Save the training data
 DATA_DIR = Path(__file__).parent / "data"
@@ -636,7 +711,9 @@ DATA_DIR.mkdir(exist_ok=True)
 GAME_TOKENS_PATH = DATA_DIR / "games_tokens.pt"
 GAME_VALID_MOVES_PATH = DATA_DIR / "games_valid_moves.pt"
 
-def make_training_data() -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+
+def make_training_data(
+) -> Tuple[Int[Tensor, 'n_games moves=60'], Bool[Tensor, 'n_games moves=60 rows=8 cols=8']]:
     """Generate the training data and save it to disk.
 
     Returns:
@@ -658,8 +735,10 @@ def make_training_data() -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor,
 
     return games_tokens, games_valid_moves
 
+
 # %%
-def get_training_data() -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor, 'n_games moves=60 rows=8 cols=8']]:
+def get_training_data(
+) -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor, 'n_games moves=60 rows=8 cols=8']]:
     """Load the training data.
 
     Returns:
@@ -673,28 +752,39 @@ def get_training_data() -> Tuple[Int[Tensor, 'n_games moves=60'], Float[Tensor, 
 
 STATS_PATH = DATA_DIR / "stats.pt"
 
-def compute_stats(games_states, games_valid_moves, n_games: int = 0) -> Float[Tensor, 'stat cell row col']:
+
+def compute_stats(games_states: Int[Tensor, 'games moves rows cols'],
+                  games_valid_moves: Optional[Bool[Tensor, 'games moves rows cols']] = None,
+                  n_games: int = 0) -> Float[Tensor, 'stat cell row col']:
     """Compute statistics about the training data
     Per move and per position:
     - Frequency of the cell being empty
     - Frequency of the cell being occupied by my piece
     - Frequency of the cell being occupied by the opponent's piece
-    - Frequency of the cell being a valid move
+    - Frequency of the cell being a valid move (if `games_valid_moves` is provided)
     """
 
     n_games = n_games % len(games_states)
     if n_games == 0:
         n_games = len(games_states)
 
-    stats = t.zeros(4, 60, 8, 8)
-    for board_states, valid_moves in tqdm(zip(games_states[:n_games], games_valid_moves[:n_games]), desc="Computing stats"):
+    n_stats = 3 + (games_valid_moves is not None)
+    if games_valid_moves is None:
+        games_valid_moves = [None] * n_games
 
-        stats += t.stack([
+    stats = t.zeros(n_stats, 60, 8, 8)
+    for board_states, valid_moves in tqdm(zip(games_states[:n_games], games_valid_moves[:n_games]),
+                                          desc="Computing stats",
+                                          total=n_games):
+        game_stats = [
             board_states == 0,  # empty
             board_states == 1,  # my piece
             board_states == -1,  # their piece
-            valid_moves == 1,  # valid move
-        ])
+        ]
+        if valid_moves is not None:
+            game_stats.append(valid_moves == 1)
+
+        stats += t.stack(game_stats)
     stats /= n_games
 
     if not STATS_PATH.exists():
@@ -704,5 +794,62 @@ def compute_stats(games_states, games_valid_moves, n_games: int = 0) -> Float[Te
         print(f"Warning: {STATS_PATH.resolve()} already exists. Not saving the stats.")
 
     return stats
+
+
+# %%
+def valid_moves_from_board(board_state: Int[Tensor, 'row col'], move_index: int) -> List[int]:
+    """Get the valid moves from the board state at the given move index (to indicate the next player)
+
+    move_index is 1-based, so 1 is the first move, 2 is the second move, etc.
+    It corresponds to the number of moves that have been played (same as game[:move_index])
+    """
+    # np_board_state = move_sequence_to_state(tokens_to_board(orig_games), mode="normal")[0, -1].numpy()
+    # print(np_board_state)
+    state = OthelloBoardState()
+    state.state = utils.to_numpy(board_state)
+    # -1 or -1. First move is +1
+    state.next_hand_color = ((move_index + 1) % 2) * 2 - 1
+    return state.get_valid_moves()
+
+
+# %%
+def swap_subspace(
+    original: Float[Tensor, "batch d_model"],
+    patch: Float[Tensor, "batch d_model"],
+    subspace: Float[Tensor, "... d_model"],
+    make_orthonormal_basis: bool = True,
+) -> Float[Tensor, "batch d_model"]:
+    """
+    Swap the subspace of the original with the subspace of the patch.
+
+    Args:
+        original: the original embedding
+        patch: the patch to apply
+        subspace: and orthonormal basis of the subspace to swap (except if make_orthogonal_basis is True)
+        make_orthonormal_basis: if True, the subspace is made orthonormal before being used.
+            This needs to be True if the subspace is not an orthonormal basis, or the result will be wrong.
+
+    Returns:
+        original ⊥ subspace + (patch - (patch ⊥ subspace))
+    """
+
+    # Step 0. Find a basis of the subspace of the probe
+    subspace = subspace.flatten(end_dim=-2)
+    if make_orthonormal_basis:
+        # normalize the vectors
+        subspace = subspace / subspace.norm(dim=-1, keepdim=True)
+        # Find the basis using SVD
+        _, _, subspace = t.linalg.svd(subspace, full_matrices=False)
+
+    # Step 1. Remove the components that are in the space of the probe
+    coefficients = einops.einsum(original, subspace, "batch d_model, dir d_model -> batch dir")
+    original = original - einops.einsum(coefficients, subspace,
+                                        "batch dir, dir d_model -> batch d_model")
+
+    # 2. Add the component of the from the new_cache
+    coefficients = einops.einsum(patch, subspace, "batch d_model, dir d_model -> batch dir")
+    return original + einops.einsum(subspace, coefficients,
+                                    "dir d_model, batch dir -> batch d_model")
+
 
 # %%

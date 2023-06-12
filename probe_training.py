@@ -19,9 +19,7 @@ import einops
 import numpy as np
 import plotly.express as px
 import torch as t
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+import torch.utils.data as data
 import transformer_lens
 import transformer_lens.utils as utils
 import wandb
@@ -47,17 +45,24 @@ try:
 except ValueError:
     print("pytorch_lightning working")
 
-
 PROBE_DIR = Path(__file__).parent / 'probes'
 PROBE_DIR.mkdir(exist_ok=True)
+
+# %%
 
 
 @dataclass
 class ProbeTrainingArgs:
     # Data  # TODO: Use a proper data loader, this is a hack for now
     train_tokens: Int[Tensor, "num_games full_game_len=60"]
-    train_valid_moves: Int[Tensor, "num_games full_game_len rows=8 cols=8"]
-    train_dataset_stats: Float[Tensor, 'stat=4 full_game_len rows cols']
+    """Tokens between 0 and 60"""
+    train_states: Int[Tensor, "num_games full_game_len=60 rows cols"]
+
+    valid_tokens: Int[Tensor, "num_games full_game_len=60"]
+    valid_states: Int[Tensor, "num_games full_game_len=60 rows cols"]
+
+    correct_for_dataset_bias: Bool = True
+    """Wether to correct for options that are present more often, per move and per game"""
 
     # Which layer, and which positions in a game sequence to probe
     layer: int = 6
@@ -71,24 +76,31 @@ class ProbeTrainingArgs:
 
     # Standard training hyperparams
     max_epochs: int = 8
-    num_games: int = 50000
 
     # Hyperparams for optimizer
-    batch_size: int = 256
+    batch_size: int = 250
     lr: float = 1e-4
     betas: Tuple[float, float] = (0.9, 0.99)
     wd: float = 0.01
 
     # Othognal regularization (to an other probe)
-    penalty_weight: float = 10_000.0
+    penalty_weight: float = 1_000.0
 
     # Misc.
     probe_name: str = "main_linear_probe"
 
     def __post_init__(self):
-        assert self.num_games <= self.train_tokens.shape[0]
+        assert self.pos_start < self.pos_end, "pos_start should be smaller than pos_end"
+        assert (self.train_tokens < 60).all(), "Train tokens should be between 0 and 60"
+        assert (self.valid_tokens < 60).all(), "Valid tokens should be between 0 and 60"
 
-    def setup_linear_probe(self, model: HookedTransformer) -> Float[Tensor, "d_model rows cols options"]:
+        if self.correct_for_dataset_bias:
+            stats = compute_stats(self.train_states)
+            self.dataset_stats = einops.rearrange(stats,
+                                                  "stat move rows cols -> move rows cols stat")
+
+    def setup_linear_probe(self,
+                           model: HookedTransformer) -> Float[Tensor, "d_model rows cols options"]:
         """Returns a randomly initialized linear probe.
 
         The probe is a tensor of shape (d_model, rows, cols, options)."""
@@ -119,49 +131,46 @@ class LitLinearProbe(pl.LightningModule):
         super().__init__()
         self.model = model
         self.args = args
-        self.linear_probe = nn.Parameter(args.setup_linear_probe(model))
+        self.linear_probe = t.nn.Parameter(args.setup_linear_probe(model))
         """shape: (d_model, rows, cols, options)"""
         self.old_probes = [
             (old_probe / t.norm(old_probe, dim=0)).to(self.model.cfg.device).detach()
             for old_probe in old_probes
-            ]
+        ]
+
+        if args.correct_for_dataset_bias:
+            args.dataset_stats = args.dataset_stats.to(self.model.cfg.device)
 
         pl.seed_everything(42, workers=True)
 
     # def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
-    def training_step(self,
-                      batch: Int[Tensor, "game_idx"],
-                      batch_idx: int) -> t.Tensor:
+    def training_step(self, batch: Tuple[Int[Tensor, "game move"], Int[Tensor,
+                                                                       "game move row col"]],
+                      batch_idx: int) -> Float[Tensor, ""]:
         """Return the loss for a batch."""
 
+        game_len = self.args.length
         focus_moves = slice(self.args.pos_start, self.args.pos_end)
 
-        games_token = self.args.train_tokens[batch.cpu()]
-        games_board_index = self.args.train_board_indices[batch.cpu()]
-        state_stack = move_sequence_to_state(games_board_index, mode="alternate")
-        state_stack = state_stack[:, focus_moves]
+        tokens, states = batch
 
-        state_stack_one_hot = state_stack_to_one_hot(state_stack).to(self.model.cfg.device)
-        batch_size = self.args.batch_size
-        game_len = self.args.length
-
-        assert isinstance(games_token, Int[Tensor, f"batch={batch_size} full_game_len=60"])
+        state_stack_one_hot = state_stack_to_one_hot(states)[:, focus_moves]
 
         # state_stack_one_hot = tensor of one-hot encoded states for each game
         # We'll multiply this by our probe's estimated log probs along the `options` dimension, to get probe's estimated log probs for the correct option
         assert isinstance(
             state_stack_one_hot,
-            Int[
+            Bool[
                 Tensor,
-                f"batch={batch_size} game_len={game_len} rows=8 cols=8 options=3",
+                f"batch game_len={game_len} rows=8 cols=8 options=3",
             ],
-        )
+        ), state_stack_one_hot.shape
 
         act_name = utils.get_act_name("resid_post", self.args.layer)
 
         with t.inference_mode():
             _, cache = self.model.run_with_cache(
-                games_token[:, :-1],  # Not the last move
+                tokens[:, :-1],  # Not the last move
                 names_filter=lambda name: name == act_name,
             )
 
@@ -174,10 +183,13 @@ class LitLinearProbe(pl.LightningModule):
             "d_model row col option, batch move d_model -> batch move row col option",
         )
         probe_logprobs = probe_logits.log_softmax(dim=-1)
+        loss = probe_logprobs * state_stack_one_hot.float()
+        if self.args.correct_for_dataset_bias:
+            loss = loss / (self.args.dataset_stats[focus_moves] + 1e-5)
         # Multiply to correct for the mean over options
-        loss = -(probe_logprobs * state_stack_one_hot).mean() * self.args.options
+        loss = -loss.mean() * self.args.options
 
-        penalisation = 0.0
+        penalisation = t.tensor(0.0, device=self.model.cfg.device)
         for old_probe in self.old_probes:
             cosine_sim_sq = einops.einsum(
                 old_probe,
@@ -189,23 +201,68 @@ class LitLinearProbe(pl.LightningModule):
 
         total_loss = loss + penalisation
 
-        self.log("train_loss", loss)
+        self.log("loss", loss)
         self.log("penalisation", penalisation)
         self.log("total_loss", total_loss)
         return total_loss
 
     def train_dataloader(self):
         """
-        Returns `games_int` and `state_stack_one_hot` tensors.  TODO: Actually return the data
+        Returns `games_int` and `state_stack_one_hot` tensors.
         """
-        n_indices = self.args.num_games - (self.args.num_games % self.args.batch_size)
-        full_train_indices = t.randperm(self.args.num_games)[:n_indices]
-        full_train_indices = einops.rearrange(
-            full_train_indices,
-            "(batch_idx game_idx) -> batch_idx game_idx",
-            game_idx=self.args.batch_size,
+        device = self.model.cfg.device
+
+        games_tokens = self.args.train_tokens.to(device)
+        games_states = self.args.train_states.to(device)
+
+        data_loader = data.DataLoader(
+            data.TensorDataset(games_tokens, games_states),
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=0,
         )
-        return full_train_indices
+
+        return data_loader
+
+    def validation_step(self, batch: Tuple[Int[Tensor, "game move"], Int[Tensor,
+                                                                         "game move row col"]],
+                        batch_idx: int) -> Float[Tensor, ""]:
+
+        tokens, states = batch
+
+        acc: Float[Tensor, "move option=3"]
+        acc = plot_probe_accuracy(
+            self.model,
+            self.linear_probe,
+            tokens,
+            TOKENS_TO_BOARD.to(tokens.device)[tokens],
+            per_option=True,
+            per_move='board_accuracy',
+            plot=False,
+        )
+        acc_per_option = acc.mean(dim=0)
+
+        self.log("Validation board accuracy", acc.mean())
+        self.log("Validation board accuracy - blank", acc_per_option[0])
+        self.log("Validation board accuracy - mine", acc_per_option[1])
+        self.log("Validation board accuracy - their", acc_per_option[2])
+        self.log("Validation board accuracy - Move variance", acc.mean(1).var())
+
+        return acc.mean()
+
+    def val_dataloader(self):
+        device = self.model.cfg.device
+
+        games_tokens = self.args.valid_tokens.to(device)
+        games_states = self.args.valid_states.to(device)
+
+        data_loader = data.DataLoader(
+            data.TensorDataset(games_tokens, games_states),
+            batch_size=len(games_tokens),
+            num_workers=0,
+        )
+
+        return data_loader
 
     def configure_optimizers(self):
         return t.optim.AdamW(
@@ -220,8 +277,13 @@ class LitLinearProbe(pl.LightningModule):
 # Create the model & training system
 FIRST_PROBE_PATH = PROBE_DIR / f"main_linear_probe.pt"
 SECOND_PROBE_PATH = PROBE_DIR / f"orthogonal_probe.pt"
+THIRD_PROBE_PATH = PROBE_DIR / f"orthogonal_probe_2.pt"
+PROBE_PATHS = [FIRST_PROBE_PATH, SECOND_PROBE_PATH, THIRD_PROBE_PATH]
 
-def get_probe(n: int = 0, flip_mine: bool = False, device='cpu') -> Float[Tensor, "d_model rows cols options"]:
+
+def get_probe(n: int = 0,
+              flip_mine: bool = False,
+              device='cpu') -> Float[Tensor, "d_model rows cols options"]:
     """
     Load the probes that I trained.
 
@@ -238,8 +300,13 @@ def get_probe(n: int = 0, flip_mine: bool = False, device='cpu') -> Float[Tensor
             2: Opponent (or mine if `flip_mine` is True)
     """
 
-    assert n in (0, 1)
-    path = [FIRST_PROBE_PATH, SECOND_PROBE_PATH][n]
+    path = PROBE_DIR / f"orthogonal_probe_{n}.pt"
+    if not path.exists():
+        valid_probes = list(PROBE_DIR.glob("orthogonal_probe_*.pt"))
+        if len(valid_probes) == 0:
+            raise FileNotFoundError(f"Could not find any probes in {PROBE_DIR}.")
+        raise FileNotFoundError(f"Could not find probe {n} in {PROBE_DIR}. "
+                                f"Valid probes are {valid_probes}.")
 
     print(f"Loading probe from {path.resolve()}")
     probe = t.load(path, map_location=device)
@@ -251,7 +318,7 @@ def get_probe(n: int = 0, flip_mine: bool = False, device='cpu') -> Float[Tensor
             probe[..., 1],
         ], dim=-1)
 
-    return probe
+    return probe.to(device)
 
 
 # %%
@@ -276,7 +343,6 @@ if TRAIN_FIRST_PROBE:
     if not FIRST_PROBE_PATH.exists():
         t.save(new_probe, FIRST_PROBE_PATH)
         print(f"Saved probe to {FIRST_PROBE_PATH.resolve()}")
-
 
 # %% Training an orthogonal probe
 
