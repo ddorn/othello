@@ -21,7 +21,7 @@ try:
     from pytorch_lightning import LightningModule
 except ValueError:
     LightningModule = object
-    print("pytorch_lightning working")
+    print("pytorch_lightning not working. Cannot train probes.")
 
 
 PROBE_DIR = Path(__file__).parent / "probes"

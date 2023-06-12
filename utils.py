@@ -42,7 +42,7 @@ BOARD_TO_TOKENS[TOKENS_TO_BOARD[1:]] = t.arange(1, 61)
 
 def tokens_to_board(tokens):
     """Map from token index (0 <= t < 60) to board index (0 < b < 64)"""
-    return TOKENS_TO_BOARD[tokens].to(tokens.device)
+    return TOKENS_TO_BOARD.to(tokens.device)[tokens]
 
 
 def board_label_to_row_col(label: str) -> Tuple[int, int]:
@@ -402,8 +402,7 @@ def get_loss(
 def plot_probe_accuracy(
     model: HookedTransformer,
     probe: Float[Tensor, "d_model rows cols options"],
-    game_tokens: Int[Tensor, "batch game_len"],
-    game_board_index: Int[Tensor, "batch game_len"],
+    tokens: Int[Tensor, "batch game_len"],
     pos_start: int = 5,
     pos_end: int = -5,
     layer: int = 6,
@@ -419,13 +418,13 @@ def plot_probe_accuracy(
 
     If options_stats is provided, it will be used to compute the weighted accuracy instead.
     """
-    pos_end = pos_end % game_tokens.shape[1]  # making sure it's positive
+    pos_end = pos_end % tokens.shape[1]  # making sure it's positive
 
     # Compute the probe output
     act_name = utils.get_act_name("resid_post", layer)
     with t.inference_mode():
         _, cache = model.run_with_cache(
-            game_tokens[:, :pos_end].to(model.cfg.device),  # We ignore the last moves here
+            tokens[:, :pos_end].to(model.cfg.device),  # We ignore the last moves here
             names_filter=lambda name: name == act_name,
         )
     resid = cache[act_name][:, pos_start:]  # We ignore the first moves here
@@ -436,7 +435,7 @@ def plot_probe_accuracy(
     )
 
     # Compute the expected states
-    states = move_sequence_to_state(game_board_index, "alternate")[:, pos_start:pos_end]
+    states = move_sequence_to_state(tokens_to_board(tokens), "alternate")[:, pos_start:pos_end]
     states_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
     states_one_hot: Bool[Tensor, "game move row col options"]
 
@@ -604,7 +603,7 @@ def generate_random_game(
     """Generate a random game of othello by choosing valid moves uniformly at random.
 
     Returns:
-        moves: a sequence of moves, where each move an integer between 0 and 63 (inclusive)
+        tokens: a sequence of tokens, where each move an integer between 1 and 59 (inclusive)
         valid_moves: the valid moves for each move, as a one-hot encoding of the board state
     """
     state = OthelloBoardState()
@@ -621,13 +620,23 @@ def generate_random_game(
         moves.append(move)
         state.umpire(move)
 
-    return t.tensor(moves), valid_moves.reshape(60, 8, 8)
+    return BOARD_TO_TOKENS[moves], valid_moves.reshape(60, 8, 8)
 
 
 def generate_training_data(
     n: int = 100,
     seed: int = 42
 ) -> Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]:
+    """Generate training data.
+
+    Args:
+        n (int, optional): The number of games to generate.
+        seed (int, optional): The seed to use for the random number generator.
+
+    Returns:
+        tokens: sequences of tokens, where each move an integer between 1 and 59 (inclusive)
+        valid_moves: the valid moves for each move, as a one-hot encoding of the board state
+    """
     random.seed(seed)
     training_data = joblib.Parallel(n_jobs=-1)(joblib.delayed(generate_random_game)()
                                                for _ in trange(n))
