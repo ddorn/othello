@@ -183,7 +183,7 @@ def alternate_states(
 
 def move_sequence_to_state(
     moves_board_index: Int[Tensor, "batch moves"],
-    mode: Literal["valid", "black-white", "mine-their"],
+    mode: Literal["valid", "black-white", "mine-their", "turn"],
     use_actual_turns: bool = True,
 ) -> Float[Tensor, "batch moves rows=8 cols=8"]:
     """Convert sequences of moves into a sequence of board states.
@@ -192,6 +192,7 @@ def move_sequence_to_state(
     If `mode="valid"`, then the board state is a one-hot encoding of the valid moves.
     If `mode="black-white"`, then the board state is encoded as black (+1) and white (-1) pieces.
     If `mode="mine-their"`, then the board state encoded as mine (+1) and their (-1) pieces.
+    If `mode="turn", this returns a tensor of shape (batch, moves) where the [b, m]-th entry is +1 if it's black's turn and -1 for white's turn.
 
     Board states are always the state after before the move is played.
 
@@ -204,7 +205,7 @@ def move_sequence_to_state(
         Float[Tensor, "batch moves rows=8 cols=8"]: the board states
     """
     assert len(moves_board_index.shape) == 2
-    assert mode in ("valid", "black-white", "mine-their")
+    assert mode in ("valid", "black-white", "mine-their", "turn")
 
     # Speed up the computation by doing it in parallel
     nb_games = moves_board_index.shape[0]
@@ -224,6 +225,8 @@ def move_sequence_to_state(
 
     if mode == "valid":
         dtype = t.bool
+    elif mode == "turn":
+        dtype = t.int8
     else:
         dtype = t.float32
 
@@ -241,6 +244,8 @@ def move_sequence_to_state(
                 states[b, m] = t.tensor(board.state) * ((m % 2) * 2 - 1)
             elif mode == "black-white":
                 states[b, m] = t.tensor(board.state)
+            elif mode == "turn":
+                states[b, m] = board.next_hand_color
             else:
                 raise ValueError(f"Unknown mode {mode}")
 

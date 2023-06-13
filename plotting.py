@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from functools import cached_property
 import os
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 import einops
 import plotly.express as px
@@ -137,18 +137,21 @@ class ModelMetricPlotter:
 
     @cached_property
     def loss(self) -> Float[Tensor, "game move"]:
+        """Loss of the model per move/token"""
         l = -self.out.log_softmax(dim=-1) * self.expected.float()
         return l.sum(dim=-1)
 
     @cached_property
     def loss_scaled(self) -> Float[Tensor, "game move"]:
+        """Loss of the model per move/token, scaled by the number of valid moves"""
         metric = self.out.log_softmax(dim=-1) * self.expected.float()
         metric = -metric.sum(dim=-1)
         return metric / self.nb_valid_moves
 
     @cached_property
     def high_logit(self) -> Float[Tensor, "game move cell"]:
-        predicted = self.softmax(dim=-1) > 1 / (2 * self.nb_valid_moves[..., None])
+        """1 when the probability of the cell is higher than 1/2 * nb_valid_moves, 0 otherwise"""
+        predicted = self.out.softmax(-1) > 1 / (2 * self.nb_valid_moves[..., None])
         return (predicted == self.expected).float()
 
     @cached_property
@@ -158,7 +161,9 @@ class ModelMetricPlotter:
         metric[~self.expected] = 1 - metric[~self.expected]
         return metric
 
-    def reduce(self, metric: Float[Tensor, "game move *cell"], mode: str = "per_move") -> None:
+    def reduce(self, metric: Float[Tensor, "game move *cell"],
+               mode: Literal['per_cell', 'per_move', 'board_sum', 'board_prod'] = "per_move") -> Tensor:
+        assert mode in ("per_cell", "per_move", "board_sum", "board_prod"), f"Unknown mode: {mode}"
         if metric.ndim != 3:
             assert (mode == "per_move"
                     ), f"Can only reduce per_move for 3-dim tensors, got {metric.shape}"
@@ -169,9 +174,9 @@ class ModelMetricPlotter:
             metric = metric.mean(dim=(0, 1)).reshape(8, 8)
         elif mode == "per_move":  # -> moves
             metric = metric.mean(dim=(0, 2))
-        elif mode == "board-sum":  # moves
+        elif mode == "board_sum":  # moves
             metric = metric.sum(2).mean(0)
-        elif mode == "board-prod":  # moves
+        elif mode == "board_prod":  # moves
             metric = metric.prod(2).mean(0)
         else:
             raise ValueError(f"Unknown per_move: {mode}")
@@ -188,6 +193,15 @@ class ModelMetricPlotter:
             self.reduce(self.loss_scaled if rescaled else self.loss, "per_move"),
             yaxis_title="Loss",
         )
+
+    def plot_whole_board_accuracy(self, name: str = "OthelloGPT"):
+        self.plot_by_move(
+            f"Frequency of the whole board being correct for {name}",
+            ["Correct board"],
+            self.reduce(self.high_logit, "board_prod"),
+            yaxis_title="Frequency",
+        )
+
 
     def plot_by_move(
         self,
@@ -362,8 +376,106 @@ def plot_aggregate_metric(
 
     return metric
 
+def explain_game(
+    tokens: Int[Tensor, 'move'],
+    model: HookedTransformer,
+    move: int = None,
+    # Extra args
+    extra_boards: Optional[Dict[str, Tensor]] = None,
+) -> None:
+    if isinstance(tokens, list):
+        tokens = t.tensor(tokens, dtype=t.long)
+    if move is None:
+        move = tokens.shape[0] - 1
+    move = move % tokens.shape[0]
+    if extra_boards is None:
+        extra_boards = {}
+
+    tokens = tokens[None, :move+1]
+    board_indices = TOKENS_TO_BOARD[tokens]
+
+    logits = model(tokens)
+
+    scale = logits.abs().max() * 0.5
+    predictions = logits_to_board(logits, 'log_prob')
+    state = move_sequence_to_state(board_indices, mode='black-white') * scale
+    valid = move_sequence_to_state(board_indices, mode="valid") * scale
+    turn = move_sequence_to_state(board_indices, mode="turn")
+    if turn[0, -1, 0, 0].item() == +1:
+        turn_label = "Blue"
+    else:
+        turn_label = "Red"
+
+    # Scale extra boards if they are boolean
+    for k, v in extra_boards.items():
+        if v.dtype == t.bool:
+            extra_boards[k] = v * scale
+
+    # Plotting
+    boards = t.stack([
+        state[0, -1],
+        valid[0, -1],
+        predictions[0, -1],
+        *extra_boards.values(),
+    ], dim=0)
+    plot_square_as_board(
+        boards,
+        facet_col=0,
+        facet_col_wrap=3 if len(boards) != 4 else 2,
+        facet_labels=["State before", "Valid moves", "Model logits", *extra_boards.keys()],
+        title=f"Game after {to_board_label(board_indices[0, -1].item())} - {turn_label} to play - move {move}",
+    )
+
+
+@t.inference_mode()
+def find_failed_predictions(
+    model: HookedTransformer,
+    tokens: Int[Tensor, 'game move'],
+    threshold: float = 2,
+    nb_examples: int = 10,
+) -> None:
+    """
+    Find sequences of moves where the model fails to predict the valid moves.
+
+    Plots the board for each datapoint where the model fails to predict the valid moves.
+    """
+
+    # Get the probabilities for each cell
+    logits = model(tokens[:, :59])
+    probabilities = logits_to_board(logits, 'prob')  # [game, move, row, col]
+    # Compute the number of valid moves
+    valid_moves = move_sequence_to_state(TOKENS_TO_BOARD[tokens], mode="valid")[:, :59]
+    nb_valid_moves = valid_moves.sum(dim=(-1, -2), keepdim=True)  # [game, move, 1, 1]
+
+    # Find which moves are considered correct
+    predictions = probabilities > (1 / (threshold * nb_valid_moves))
+    correct = predictions == valid_moves
+    correct_boards = (predictions == valid_moves).all(-1).all(-1)
+
+    # Find the indices of the incorrect moves
+    incorrect_indices = t.nonzero(~correct_boards, as_tuple=False)
+    # Sample from the incorrect indices
+    incorrect_indices = incorrect_indices[t.randperm(len(incorrect_indices))]
+    incorrect_indices = incorrect_indices[:nb_examples]
+
+    # Plot the incorrect moves
+    for game, move in incorrect_indices:
+        explain_game(tokens[game],
+                     model,
+                     move,
+                     extra_boards={
+                         "Model's mistakes": ~correct[game, move],
+                     })
+        # plot_board(TOKENS_TO_BOARD[tokens[game]])
+
 
 __all__ = [
-    name for name, value in globals().items()
-    if hasattr(value, "__module__") and value.__module__ == __name__ and name.startswith("plot_")
-] + ["ModelMetricPlotter"]
+    "plot_square_as_board",
+    "plot_similarities",
+    "plot_similarities_2",
+    "plot_PCA",
+    "ModelMetricPlotter",
+    "plot_aggregate_metric",
+    "find_failed_predictions",
+    "explain_game",
+]
