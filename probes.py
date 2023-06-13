@@ -10,7 +10,6 @@ import numpy as np
 import torch as t
 import torch.utils.data as data
 import transformer_lens.utils as utils
-import wandb
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from transformer_lens import HookedTransformer
@@ -19,10 +18,11 @@ from utils import *
 
 try:
     from pytorch_lightning import LightningModule
+    import pytorch_lightning as pl
 except ValueError:
+    pl = None
     LightningModule = object
     print("pytorch_lightning not working. Cannot train probes.")
-
 
 PROBE_DIR = Path(__file__).parent / "probes"
 PROBE_DIR.mkdir(exist_ok=True)
@@ -105,7 +105,7 @@ def get_neels_probe(merge_mine_theirs: bool = True,
         linear_probe[..., their_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 1] +
                                                 full_linear_probe[white_to_play_index, ..., 2])
         linear_probe[..., my_index] = 0.5 * (full_linear_probe[black_to_play_index, ..., 2] +
-                                            full_linear_probe[white_to_play_index, ..., 1])
+                                             full_linear_probe[white_to_play_index, ..., 1])
     else:
         linear_probe = full_linear_probe[0]
 
@@ -117,12 +117,13 @@ class ProbeTrainingArgs:
     # Data  # TODO: Use a proper data loader, this is a hack for now
     train_tokens: Int[Tensor, "num_games full_game_len=60"]
     """Tokens between 0 and 60"""
-    train_states: Int[Tensor, "num_games full_game_len=60 rows cols"]
 
     valid_tokens: Int[Tensor, "num_games full_game_len=60"]
-    valid_states: Int[Tensor, "num_games full_game_len=60 rows cols"]
 
-    correct_for_dataset_bias: Bool = True
+    black_and_white: bool = False
+    """Whether to predict black/white cells or mine/theirs"""
+
+    correct_for_dataset_bias: Bool = False
     """Wether to correct for options that are present more often, per move and per game"""
 
     # Which layer, and which positions in a game sequence to probe
@@ -152,13 +153,12 @@ class ProbeTrainingArgs:
 
     def __post_init__(self):
         assert self.pos_start < self.pos_end, "pos_start should be smaller than pos_end"
-        assert (self.train_tokens < 60).all(), "Train tokens should be between 0 and 60"
-        assert (self.valid_tokens < 60).all(), "Valid tokens should be between 0 and 60"
-
-        if self.correct_for_dataset_bias:
-            stats = compute_stats(self.train_states)
-            self.dataset_stats = einops.rearrange(stats,
-                                                  "stat move rows cols -> move rows cols stat")
+        assert (
+            self.train_tokens
+            < 61).all(), f"Train tokens should be between 0 and 60, got {self.train_tokens.max()}"
+        assert (
+            self.valid_tokens
+            < 61).all(), f"Valid tokens should be between 0 and 60, got {self.valid_tokens.max()}"
 
     def setup_linear_probe(self,
                            model: HookedTransformer) -> Float[Tensor, "d_model rows cols options"]:
@@ -187,16 +187,16 @@ class ProbeTrainingArgs:
 class LitLinearProbe(LightningModule):
     """A linear probe for a transformer with its training configured for pytorch-lightning."""
 
+    dataset_stats: Optional[Float[Tensor, "move rows cols stat"]]
+
     def __init__(
         self,
         model: HookedTransformer,
         args: ProbeTrainingArgs,
         *old_probes: Float[Tensor, "d_model rows cols options"],
     ):
-        assert LightningModule is not object, (
-            "pytorch_lightning is not working. "
-            "import it manually to see the error message."
-        )
+        assert LightningModule is not object, ("pytorch_lightning is not working. "
+                                               "import it manually to see the error message.")
 
         super().__init__()
 
@@ -209,10 +209,10 @@ class LitLinearProbe(LightningModule):
             for old_probe in old_probes
         ]
 
-        if args.correct_for_dataset_bias:
-            args.dataset_stats = args.dataset_stats.to(self.model.cfg.device)
+        self.dataset_stats = None
 
         pl.seed_everything(42, workers=True)
+
 
     # def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
     def training_step(
@@ -258,7 +258,7 @@ class LitLinearProbe(LightningModule):
         probe_logprobs = probe_logits.log_softmax(dim=-1)
         loss = probe_logprobs * state_stack_one_hot.float()
         if self.args.correct_for_dataset_bias:
-            loss = loss / (self.args.dataset_stats[focus_moves] + 1e-5)
+            loss = loss / (self.dataset_stats[focus_moves] + 1e-5)
         # Multiply to correct for the mean over options
         loss = -loss.mean() * self.args.options
 
@@ -279,24 +279,6 @@ class LitLinearProbe(LightningModule):
         self.log("total_loss", total_loss)
         return total_loss
 
-    def train_dataloader(self):
-        """
-        Returns `games_int` and `state_stack_one_hot` tensors.
-        """
-        device = self.model.cfg.device
-
-        games_tokens = self.args.train_tokens.to(device)
-        games_states = self.args.train_states.to(device)
-
-        data_loader = data.DataLoader(
-            data.TensorDataset(games_tokens, games_states),
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=0,
-        )
-
-        return data_loader
-
     def validation_step(
         self,
         batch: Tuple[Int[Tensor, "game move"], Int[Tensor, "game move row col"]],
@@ -309,9 +291,9 @@ class LitLinearProbe(LightningModule):
             self.model,
             self.linear_probe,
             tokens,
-            TOKENS_TO_BOARD.to(tokens.device)[tokens],
             per_option=True,
             per_move="board_accuracy",
+            black_and_white=self.args.black_and_white,
             plot=False,
         )
         acc_per_option = acc.mean(dim=0)
@@ -324,19 +306,38 @@ class LitLinearProbe(LightningModule):
 
         return acc.mean()
 
-    def val_dataloader(self):
+    def make_dataset(self, tokens: Float[Tensor, 'game move']):
         device = self.model.cfg.device
 
-        games_tokens = self.args.valid_tokens.to(device)
-        games_states = self.args.valid_states.to(device)
+        states = move_sequence_to_state(
+            TOKENS_TO_BOARD[tokens],
+            'normal' if self.args.black_and_white else 'alternate').to(device)
+
+        return tokens.to(device), states
+
+    def train_dataloader(self):
+        """
+        Returns `games_int` and `state_stack_one_hot` tensors.
+        """
+        tokens, states = self.make_dataset(self.args.train_tokens)
+
+        if self.args.correct_for_dataset_bias:
+            self.dataset_stats = einops.rearrange(compute_stats(states),
+                                                  "stat move rows cols -> move rows cols stat")
 
         data_loader = data.DataLoader(
-            data.TensorDataset(games_tokens, games_states),
-            batch_size=len(games_tokens),
-            num_workers=0,
+            data.TensorDataset(tokens, states),
+            batch_size=self.args.batch_size,
+            shuffle=True,
         )
 
         return data_loader
+
+    def val_dataloader(self):
+        return data.DataLoader(
+            data.TensorDataset(*self.make_dataset(self.args.valid_tokens)),
+            batch_size=len(self.args.valid_tokens),
+        )
 
     def configure_optimizers(self):
         return t.optim.AdamW(

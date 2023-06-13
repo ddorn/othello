@@ -32,6 +32,8 @@ if not OTHELLO_ROOT.exists():
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
     OthelloBoardState, )
 
+from plotting import plot_square_as_board
+
 # Conversion methods
 
 # %%
@@ -410,14 +412,33 @@ def plot_probe_accuracy(
     per_move: Literal["no", "board_accuracy", "cell_accuracy"] = "no",
     name: str = "probe",
     # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None,
-    prediction: Literal["argmax", "softmax"] = "argmax",
+    prediction: Literal["argmax", "softmax", 'logprob'] = "argmax",
+    black_and_white: bool = False,
     plot: bool = True,
 ) -> Float[Tensor, "rows cols *options"]:
     """
     Compute and plot the accuracy of the probe at each position of the board.
 
-    If options_stats is provided, it will be used to compute the weighted accuracy instead.
+    Args:
+        model (HookedTransformer): the model that is probed
+        probe (Float[Tensor, "d_model rows cols options"]): the probe to evaluate
+        tokens (Int[Tensor, "batch game_len"]): the tokenized games on which to evaluate, integers between 0 and 60
+        pos_start (int, optional): The first move to consider. Defaults to 5.
+        pos_end (int, optional): The last move to consider. Defaults to -5.
+        layer (int, optional): The layer of the model to probe. Defaults to 6.
+        per_option (bool, optional): If True, plot the accuracy for blank/mine/theirs separately.
+        per_move (Literal["no", "board_accuracy", "cell_accuracy"], optional): Plot the board or cell accuracy for each move. If 'no', plots per cell.
+        name (str, optional): The name of the probe for the plot.
+        black_and_white (bool, optional): If True, consider black/white instead of mine/theirs.
+        plot (bool, optional): If False, do not plot the results.
     """
+
+    # Make sure all tensors / models are on cpu, if available
+    if t.cuda.is_available():
+        model = model.cuda()
+        probe = probe.cuda()
+        tokens = tokens.cuda()
+
     pos_end = pos_end % tokens.shape[1]  # making sure it's positive
 
     # Compute the probe output
@@ -435,25 +456,33 @@ def plot_probe_accuracy(
     )
 
     # Compute the expected states
-    states = move_sequence_to_state(tokens_to_board(tokens), "alternate")[:, pos_start:pos_end]
+    if black_and_white:
+        mode = 'normal'
+        option_names = ['Blank', 'White', 'Black']
+    else:
+        mode = 'alternate'
+        option_names = ['Blank', 'Mine', 'Theirs']
+
+    states = move_sequence_to_state(tokens_to_board(tokens), mode)[:, pos_start:pos_end]
     states_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
     states_one_hot: Bool[Tensor, "game move row col options"]
 
-    # Transform the probe output into a prediction
-    if prediction == "argmax":
-        # The probe predict 100% on the option with the highest value, 0% on the others
+    # Transform the probe output into the plotted metric
+    if prediction == 'argmax':
         probe_values = probe_out.argmax(dim=-1, keepdim=True)
-        probe_one_hot = t.zeros_like(probe_out)
-        probe_one_hot.scatter_(-1, probe_values, 1)
-        correct = (probe_one_hot == states_one_hot).float()
-    elif prediction == "softmax":
-        # The probe predict the probability of each option
-        probs = probe_out.softmax(dim=-1)
-        correct = t.zeros_like(probs)
-        correct[states_one_hot] = probs[states_one_hot]
-        correct[~states_one_hot] = 1 - probs[~states_one_hot]
+        metric = t.zeros_like(probe_out)
+        metric.scatter_(-1, probe_values, 1)
+        # correct = (probe_one_hot == states_one_hot).float()
+    elif prediction == 'softmax':
+        metric = probe_out.softmax(dim=-1)
+        # correct[states_one_hot] = probs[states_one_hot]
+        # correct[~states_one_hot] = 1 - probs[~states_one_hot]
+    elif prediction == 'logprob':
+        metric = probe_out.log_softmax(dim=-1)
+    else:
+        raise ValueError(f"Unknown prediction mode: {prediction}")
 
-    correct: Float[Tensor, "game move row col options"]
+    metric: Float[Tensor, "game move row col options"]
 
     if False:
         # if options_stats is not None:
@@ -469,46 +498,76 @@ def plot_probe_accuracy(
         coeff = coeff / coeff.sum(dim=-1, keepdim=True)
         # remove Nan
         coeff[~t.isfinite(coeff)] = 1
-        accuracy = correct * coeff
-    else:
-        accuracy = correct
+        metric = metric * coeff
 
-    accuracy: Float[Tensor, "game move row col options"]
-
-    if per_option:
+    if per_option and False:
         # We only keep the accuracy of the correct option
         kwargs = dict(
             facet_col=2,
-            facet_labels=["Blank", "Mine", "Theirs"],
+            facet_labels=option_names,
         )
     else:
-        accuracy = accuracy * states_one_hot.float()
-        accuracy = accuracy.sum(dim=-1)
+        # Keep the metric only for the correct option
+        metric[~states_one_hot] = 0
+        metric = metric.sum(dim=-1)
         kwargs = {}
 
-    if per_move == "board_accuracy":
-        # Product over the row and col, mean over the games
-        accuracy = accuracy.prod(3).prod(2)
-        accuracy = accuracy.mean(dim=0)
-        title = f"Board accuracy of {name}"
+    # Reduce the metric to the plot we want
+    if per_move == 'no':
+        # Mean over games and moves
+        metric = metric.mean(dim=(0, 1))
+    elif per_move == "board_accuracy":
+        # Reduce the cell (row+col) dimension
+        if prediction == 'logprob':
+            # Log prob is additive. It annoys me to make a distinction here
+            # but I don't see an other way
+            metric = metric.sum((2, 3))
+        else:
+            # Other metrics are multiplicative
+            metric = metric.prod(3).prod(2)
+        # Mean over games
+        metric = metric.mean(dim=0)
     elif per_move == "cell_accuracy":
         # Mean over games and cells
-        accuracy = accuracy.mean(dim=(0, 2, 3))
-        title = f"Cell accuracy of {name}"
+        metric = metric.mean(dim=(0, 2, 3))
     else:
-        # Mean over games and moves
-        accuracy = accuracy.mean(dim=(0, 1))
+        raise ValueError(f"Unknown per_move: {per_move}")
+
+    # -------------------------------------------------
+    # We computed what we want to plot. Now we plot it.
+    # -------------------------------------------------
+
 
     if not plot:
-        return accuracy
+        return metric
 
-    if per_move != "no":
-        if accuracy.ndim == 1:
+    # Compute the title of the plot, using `name`, `prediction`, and `per_move`
+    prediction_nice = {
+        'softmax': 'Average probability',
+        'logprob': 'Average log probability',
+        'argmax': 'Average argmax',
+    }[prediction]
+    what = {
+        'no': 'each cell being wrong',
+        'board_accuracy': 'the whole board being correct',
+        'cell_accuracy': 'each cell being correct',
+    }[per_move]
+    title = f"{prediction_nice} of {what} for {name}"
+
+    if per_move == "no": # Per cell
+        plot_square_as_board(
+            1 - metric,
+            diverging_scale=False,
+            title=title
+            **kwargs,
+        )
+    else:  # Per move
+        if metric.ndim == 1:
             # If 'board_accuracy' and not per_option
-            accuracy = accuracy.unsqueeze(1)
-        labels = kwargs.get("facet_labels", ["All combined"])
+            metric = metric.unsqueeze(1)
+        labels = kwargs.get("facet_labels", ["Correct"])
         fig = go.Figure()
-        for line, label in zip(accuracy.T, labels):
+        for line, label in zip(metric.T, labels):
             fig.add_trace(go.Scatter(
                 x=t.arange(pos_start, pos_end),
                 y=line.cpu(),
@@ -522,15 +581,7 @@ def plot_probe_accuracy(
         )
         fig.show()
 
-    else:
-        plot_square_as_board(
-            1 - accuracy,
-            title=f"Error rate of {name}",
-            diverging_scale=False,
-            **kwargs,
-        )
-
-    return accuracy
+    return metric
 
 
 # %%
@@ -655,6 +706,8 @@ GAME_VALID_MOVES_PATH = DATA_DIR / "games_valid_moves.pt"
 
 
 def make_training_data(
+        n: int = 100,
+        seed: int = 42,
 ) -> (Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]):
     """Generate the training data and save it to disk.
 
@@ -662,7 +715,7 @@ def make_training_data(
         moves: a sequence of moves, where each move an integer between 0 and 63 (inclusive)
         valid_moves: the valid moves for each move, as a one-hot encoding of the board state
     """
-    games_tokens, games_valid_moves = generate_training_data()
+    games_tokens, games_valid_moves = generate_training_data(n, seed)
 
     for path, data in [
         (GAME_TOKENS_PATH, games_tokens),
@@ -715,8 +768,12 @@ def compute_stats(
     n_stats = 3 + (games_valid_moves is not None)
     if games_valid_moves is None:
         games_valid_moves = [None] * n_games
+    else:
+        assert games_valid_moves.device == games_states.device, (
+            f"games_valid_moves.device ({games_valid_moves.device}) != games_states.device ({games_states.device})"
+        )
 
-    stats = t.zeros(n_stats, 60, 8, 8)
+    stats = t.zeros(n_stats, 60, 8, 8, device=games_states.device)
     for board_states, valid_moves in tqdm(
             zip(games_states[:n_games], games_valid_moves[:n_games]),
             desc="Computing stats",
