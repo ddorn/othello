@@ -287,7 +287,7 @@ class LitLinearProbe(LightningModule):
         tokens, states = batch
 
         acc: Float[Tensor, "move option=3"]
-        acc = plot_probe_accuracy(
+        acc = plot_aggregate_metric(
             self.model,
             self.linear_probe,
             tokens,

@@ -2,7 +2,7 @@
 import os
 import random
 from dataclasses import dataclass
-from functools import partial
+from functools import cached_property, partial, wraps
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple, Union
 import joblib
@@ -78,7 +78,12 @@ def logits_to_board(
     logits: Float[Tensor, "... 61"],
     mode: Literal["log_prob", "prob", "logits"],
 ) -> Float[Tensor, "... rows=8 cols=8"]:
-    """Convert a set of logits into a board state, with each cell being a log prob of that cell being played."""
+    """
+    Convert a set of logits into a board state, with each cell being a log prob/prob/logits of that cell being played.
+
+    Returns:
+        A tensor of shape `(..., 8, 8)`
+    """
     if mode == "log_prob":
         x = logits.log_softmax(-1)
     elif mode == "prob":
@@ -91,7 +96,7 @@ def logits_to_board(
 
     extra_shape = x.shape[:-1]
     temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
-    temp_board_state[..., TOKENS_TO_BOARD] = x
+    temp_board_state[..., TOKENS_TO_BOARD[1:]] = x
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
     if mode == "log_prob":
         temp_board_state[..., [27, 28, 35, 36]] = -13
@@ -159,6 +164,7 @@ def load_sample_games(
     full_games_board_index = full_games_board_index[:max_games]
 
     return full_games_tokens, full_games_board_index
+
 
 # %%
 def one_hot(list_of_ints: List[int], num_classes=64) -> Float[Tensor, "num_classes"]:
@@ -401,10 +407,38 @@ def get_loss(
 
 
 @t.inference_mode()
-def plot_probe_accuracy(
+def get_probe_outputs(
     model: HookedTransformer,
     probe: Float[Tensor, "d_model rows cols options"],
+    tokens: Int[Tensor, "game move"],
+    layer: int = 6,
+) -> Float[Tensor, "game min(move,59) rows cols options"]:
+    # Make sure all tensors / models are on cpu, if available
+    if t.cuda.is_available():
+        model = model.cuda()
+        probe = probe.cuda()
+        tokens = tokens.cuda()
+
+    act_name = utils.get_act_name("resid_post", layer)
+
+    _, cache = model.run_with_cache(
+        tokens[:, :59],
+        names_filter=lambda name: name == act_name,
+    )
+
+    probe_out = einops.einsum(
+        cache[act_name],
+        probe,
+        "game move d_model, d_model row col options -> game move row col options",
+    )
+    return probe_out
+
+
+@t.inference_mode()
+def plot_aggregate_metric(
     tokens: Int[Tensor, "batch game_len"],
+    model: HookedTransformer,
+    probe: Optional[Float[Tensor, "d_model rows cols options"]] = None,
     pos_start: int = 5,
     pos_end: int = -5,
     layer: int = 6,
@@ -417,72 +451,51 @@ def plot_probe_accuracy(
     plot: bool = True,
 ) -> Float[Tensor, "rows cols *options"]:
     """
-    Compute and plot the accuracy of the probe at each position of the board.
+    Compute and plot an aggregate metric for the given probe.
 
     Args:
-        model (HookedTransformer): the model that is probed
-        probe (Float[Tensor, "d_model rows cols options"]): the probe to evaluate
         tokens (Int[Tensor, "batch game_len"]): the tokenized games on which to evaluate, integers between 0 and 60
+        model (HookedTransformer): the model that is probed
+        probe (Float[Tensor, "d_model rows cols options"]): the probe to use.
         pos_start (int, optional): The first move to consider. Defaults to 5.
         pos_end (int, optional): The last move to consider. Defaults to -5.
         layer (int, optional): The layer of the model to probe. Defaults to 6.
         per_option (bool, optional): If True, plot the accuracy for blank/mine/theirs separately.
         per_move (Literal["no", "board_accuracy", "cell_accuracy"], optional): Plot the board or cell accuracy for each move. If 'no', plots per cell.
         name (str, optional): The name of the probe for the plot.
+        prediction (Literal["argmax", "softmax", 'logprob'], optional): What to plot. 'argmax' plots the accuracy of the argmax, 'softmax' plots the accuracy of the softmax, and 'logprob' plots the log probability of the correct option.
         black_and_white (bool, optional): If True, consider black/white instead of mine/theirs.
         plot (bool, optional): If False, do not plot the results.
     """
 
-    # Make sure all tensors / models are on cpu, if available
-    if t.cuda.is_available():
-        model = model.cuda()
-        probe = probe.cuda()
-        tokens = tokens.cuda()
-
-    pos_end = pos_end % tokens.shape[1]  # making sure it's positive
-
-    # Compute the probe output
-    act_name = utils.get_act_name("resid_post", layer)
-    with t.inference_mode():
-        _, cache = model.run_with_cache(
-            tokens[:, :pos_end].to(model.cfg.device),  # We ignore the last moves here
-            names_filter=lambda name: name == act_name,
-        )
-    resid = cache[act_name][:, pos_start:]  # We ignore the first moves here
-    probe_out = einops.einsum(
-        resid,
-        probe,
-        "game move d_model, d_model row col options -> game move row col options",
-    )
+    # Compute output
+    out = get_probe_outputs(model, probe, tokens, layer)
 
     # Compute the expected states
-    if black_and_white:
-        mode = 'normal'
-        option_names = ['Blank', 'White', 'Black']
-    else:
-        mode = 'alternate'
-        option_names = ['Blank', 'Mine', 'Theirs']
+    mode = 'normal' if black_and_white else 'alternate'
+    states = move_sequence_to_state(tokens_to_board(tokens), mode)
+    correct_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
+    correct_one_hot: Bool[Tensor, "game move row col options"]
 
-    states = move_sequence_to_state(tokens_to_board(tokens), mode)[:, pos_start:pos_end]
-    states_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
-    states_one_hot: Bool[Tensor, "game move row col options"]
+    # Remove the first and last moves
+    pos_end = pos_end % tokens.shape[1]
+    out = out[:, pos_start:pos_end]
+    correct_one_hot = correct_one_hot[:, pos_start:pos_end]
 
     # Transform the probe output into the plotted metric
     if prediction == 'argmax':
-        probe_values = probe_out.argmax(dim=-1, keepdim=True)
-        metric = t.zeros_like(probe_out)
+        probe_values = out.argmax(dim=-1, keepdim=True)
+        metric = t.zeros_like(out)
         metric.scatter_(-1, probe_values, 1)
         # correct = (probe_one_hot == states_one_hot).float()
     elif prediction == 'softmax':
-        metric = probe_out.softmax(dim=-1)
+        metric = out.softmax(dim=-1)
         # correct[states_one_hot] = probs[states_one_hot]
         # correct[~states_one_hot] = 1 - probs[~states_one_hot]
     elif prediction == 'logprob':
-        metric = probe_out.log_softmax(dim=-1)
+        metric = out.log_softmax(dim=-1)
     else:
         raise ValueError(f"Unknown prediction mode: {prediction}")
-
-    metric: Float[Tensor, "game move row col options"]
 
     if False:
         # if options_stats is not None:
@@ -500,17 +513,9 @@ def plot_probe_accuracy(
         coeff[~t.isfinite(coeff)] = 1
         metric = metric * coeff
 
-    if per_option and False:
-        # We only keep the accuracy of the correct option
-        kwargs = dict(
-            facet_col=2,
-            facet_labels=option_names,
-        )
-    else:
-        # Keep the metric only for the correct option
-        metric[~states_one_hot] = 0
-        metric = metric.sum(dim=-1)
-        kwargs = {}
+    metric[~correct_one_hot] = 0
+    metric = metric.sum(dim=-1)
+    metric: Float[Tensor, "game move row col"]
 
     # Reduce the metric to the plot we want
     if per_move == 'no':
@@ -536,8 +541,6 @@ def plot_probe_accuracy(
     # -------------------------------------------------
     # We computed what we want to plot. Now we plot it.
     # -------------------------------------------------
-
-
     if not plot:
         return metric
 
@@ -554,18 +557,13 @@ def plot_probe_accuracy(
     }[per_move]
     title = f"{prediction_nice} of {what} for {name}"
 
-    if per_move == "no": # Per cell
-        plot_square_as_board(
-            1 - metric,
-            diverging_scale=False,
-            title=title
-            **kwargs,
-        )
+    if per_move == "no":  # Per cell
+        plot_square_as_board(1 - metric, diverging_scale=False, title=title)
     else:  # Per move
         if metric.ndim == 1:
             # If 'board_accuracy' and not per_option
             metric = metric.unsqueeze(1)
-        labels = kwargs.get("facet_labels", ["Correct"])
+        labels = ["Correct"]
         fig = go.Figure()
         for line, label in zip(metric.T, labels):
             fig.add_trace(go.Scatter(
@@ -582,10 +580,6 @@ def plot_probe_accuracy(
         fig.show()
 
     return metric
-
-
-# %%
-
 
 def zero_ablation_hook(activation: Tensor, hook: HookPoint, head: Optional[int] = None):
     if head is not None:
@@ -706,8 +700,8 @@ GAME_VALID_MOVES_PATH = DATA_DIR / "games_valid_moves.pt"
 
 
 def make_training_data(
-        n: int = 100,
-        seed: int = 42,
+    n: int = 100,
+    seed: int = 42,
 ) -> (Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]):
     """Generate the training data and save it to disk.
 

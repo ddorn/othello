@@ -1,14 +1,20 @@
 # %%
+from dataclasses import dataclass
+from functools import cached_property
 import os
+from typing import List
 
 import einops
 import plotly.express as px
+import plotly.graph_objects as go
+
 import torch as t
 from IPython.display import display
-from jaxtyping import Float
+from jaxtyping import Float, Int, Bool
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from torch import Tensor
+from transformer_lens import HookedTransformer
 
 from plotly_utils import imshow
 
@@ -97,6 +103,113 @@ def plot_PCA(
         ))
 
     return pca
+
+
+@dataclass(frozen=True)
+class ModelMetricPlotter:
+    tokens: Int[Tensor, "batch game_len"]
+    model: HookedTransformer
+    pos_start: int = 0
+    pos_end: int = -1
+    # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None
+
+    @cached_property
+    def out(self) -> Float[Tensor, "game move cell"]:
+        out = logits_to_board(self.model(self.tokens[:, :59]), "logits")
+        return out[:, self.focus_moves].flatten(start_dim=-2)
+
+    @cached_property
+    def expected(self) -> Bool[Tensor, "game move cell"]:
+        is_valid = move_sequence_to_state(tokens_to_board(self.tokens), 'valid')
+        return is_valid[:, self.focus_moves].flatten(start_dim=-2)
+
+    @cached_property
+    def nb_valid_moves(self) -> Int[Tensor, "game move"]:
+        return self.expected.sum(dim=-1)
+
+    @property
+    def focus_moves(self) -> slice:
+        pos_end = self.pos_end % self.tokens.shape[1]
+        return slice(self.pos_start, pos_end)
+
+    # Different metrics
+
+    @cached_property
+    def loss(self) -> Float[Tensor, "game move"]:
+        l = -self.out.log_softmax(dim=-1) * self.expected.float()
+        return l.sum(dim=-1)
+
+    @cached_property
+    def loss_scaled(self) -> Float[Tensor, "game move"]:
+        metric = self.out.log_softmax(dim=-1) * self.expected.float()
+        metric = -metric.sum(dim=-1)
+        return metric / self.nb_valid_moves
+
+    @cached_property
+    def high_logit(self) -> Float[Tensor, "game move cell"]:
+        predicted = self.softmax(dim=-1) > 1 / (2 * self.nb_valid_moves[..., None])
+        return (predicted == self.expected).float()
+
+    @cached_property
+    def scaled_probabilities(self):
+        metric = self.out.softmax(dim=-1)
+        metric *= self.nb_valid_moves[..., None]
+        metric[~self.expected] = 1 - metric[~self.expected]
+        return metric
+
+    def reduce(self, metric: Float[Tensor, "game move *cell"], mode: str = 'per_move') -> None:
+        if metric.ndim != 3:
+            assert mode == 'per_move', f"Can only reduce per_move for 3-dim tensors, got {metric.shape}"
+            return metric.mean(0)
+
+        # Reduce the metric to the plot we want
+        if mode == 'per_cell':  # -> 8x8
+            metric = metric.mean(dim=(0, 1)).reshape(8, 8)
+        elif mode == "per_move":  # -> moves
+            metric = metric.mean(dim=(0, 2))
+        elif mode == "board-sum":  # moves
+            metric = metric.sum(2).mean(0)
+        elif mode == "board-prod":  # moves
+            metric = metric.prod(2).mean(0)
+        else:
+            raise ValueError(f"Unknown per_move: {mode}")
+
+        return metric
+
+    # Different plots
+
+    def plot_loss_per_move(self, rescaled: bool = False, name: str = "OthelloGPT"):
+        title = 'Loss scaled by nb of valid moves' if rescaled else 'Loss'
+        self.plot_by_move(
+            f"{title} of {name}",
+            [title],
+            self.reduce(self.loss_scaled if rescaled else self.loss, 'per_move'),
+            yaxis_title="Loss",
+        )
+
+    def plot_by_move(self,
+                   title: str,
+                   labels: List[str],
+                     *lines: Float[Tensor, "x"],
+                   yaxis_title: str = "Accuracy",
+                   ):
+        assert len(labels) == len(lines), f"Got {len(labels)} labels and {len(lines)} lines"
+
+        fig = go.Figure()
+        for line, label in zip(lines, labels):
+            fig.add_trace(go.Scatter(
+                x=t.arange(self.pos_start, self.pos_end % self.tokens.shape[1]),
+                y=line.cpu(),
+                name=label,
+            ))
+        fig.update_layout(
+            title=title,
+            xaxis_title="Move",
+            yaxis_title=yaxis_title,
+            legend_title="Legend",
+        )
+        fig.show()
+
 
 
 __all__ = [
