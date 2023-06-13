@@ -92,7 +92,7 @@ def logits_to_board(
     temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
     temp_board_state[..., TOKENS_TO_BOARD[1:]] = x
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
-    if mode == "log_prob":
+    if mode in ("log_prob", "logits"):
         temp_board_state[..., [27, 28, 35, 36]] = -13
     return temp_board_state.reshape(*extra_shape, 8, 8)
 
@@ -183,18 +183,30 @@ def alternate_states(
 
 def move_sequence_to_state(
     moves_board_index: Int[Tensor, "batch moves"],
-    mode: Literal["valid", "alternate", "normal"] = "normal",
+    mode: Literal["valid", "black-white", "mine-their"],
+    use_actual_turns: bool = True,
 ) -> Float[Tensor, "batch moves rows=8 cols=8"]:
     """Convert sequences of moves into a sequence of board states.
     Moves are encoded as integers from 0 to 63.
 
     If `mode="valid"`, then the board state is a one-hot encoding of the valid moves.
-    If `mode="alternate"`, then the board state encoded as mine (+1) and their (-1) pieces.
+    If `mode="black-white"`, then the board state is encoded as black (+1) and white (-1) pieces.
+    If `mode="mine-their"`, then the board state encoded as mine (+1) and their (-1) pieces.
 
-    Output shape: `(batch, moves, rows=8, cols=8)
+    Board states are always the state after before the move is played.
+
+    Args:
+        moves_board_index (Int[Tensor, "batch moves"]): the moves to convert
+        mode (Literal["valid", "black-white", "mine-their"], optional): the mode to use. Defaults to "normal".
+        use_actual_turns (bool, optional): if False, computes the turn of the player from the parity of the move number rather than the rules of the game. Use only with mode="mine-their".
+
+    Returns:
+        Float[Tensor, "batch moves rows=8 cols=8"]: the board states
     """
     assert len(moves_board_index.shape) == 2
+    assert mode in ("valid", "black-white", "mine-their")
 
+    # Speed up the computation by doing it in parallel
     nb_games = moves_board_index.shape[0]
     if nb_games > 10_000:
         stack = joblib.Parallel(n_jobs=-1)(
@@ -202,9 +214,13 @@ def move_sequence_to_state(
             for i in tqdm(
                 range(0, nb_games, 1000),
                 desc="Converting moves to states",
-                unit="1000 games",
+                unit=" thousand games",
             ))
         return t.cat(stack, dim=0)
+    elif nb_games > 1_000:
+        iterator = tqdm(moves_board_index, desc="Converting moves to states")
+    else:
+        iterator = moves_board_index
 
     if mode == "valid":
         dtype = t.bool
@@ -213,22 +229,21 @@ def move_sequence_to_state(
 
     states = t.zeros((*moves_board_index.shape, 8, 8), dtype=dtype)
 
-    if nb_games > 1_000:
-        iterator = tqdm(moves_board_index, desc="Converting moves to states")
-    else:
-        iterator = moves_board_index
-
     for b, moves in enumerate(iterator):
         board = OthelloBoardState()
         for m, move in enumerate(moves):
             board.umpire(move.item())
             if mode == "valid":
                 states[b, m].flatten()[board.get_valid_moves()] = True
-            else:
+            elif mode == "mine-their" and use_actual_turns:
+                states[b, m] = t.tensor(board.state) * board.next_hand_color
+            elif mode == "mine-their":  # use parity of move number
+                states[b, m] = t.tensor(board.state) * ((m % 2) * 2 - 1)
+            elif mode == "black-white":
                 states[b, m] = t.tensor(board.state)
+            else:
+                raise ValueError(f"Unknown mode {mode}")
 
-    if mode == "alternate":
-        states = alternate_states(states)
     return states.to(moves_board_index.device)
 
 
