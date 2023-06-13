@@ -115,14 +115,16 @@ class ModelMetricPlotter:
     # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None
 
     @cached_property
+    @t.inference_mode()
     def out(self) -> Float[Tensor, "game move cell"]:
         out = logits_to_board(self.model(self.tokens[:, :59]), "logits")
         return out[:, self.focus_moves].flatten(start_dim=-2)
 
     @cached_property
+    @t.inference_mode()
     def expected(self) -> Bool[Tensor, "game move cell"]:
         is_valid = move_sequence_to_state(tokens_to_board(self.tokens), "valid")
-        return is_valid[:, self.focus_moves].flatten(start_dim=-2)
+        return is_valid[:, self.focus_moves].flatten(start_dim=-2).to(self.out.device)
 
     @cached_property
     def nb_valid_moves(self) -> Int[Tensor, "game move"]:
