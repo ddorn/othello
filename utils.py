@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple, Union
 import joblib
 
-import plotly.express as px
-import plotly.graph_objects as go
 import einops
 import numpy as np
 import torch as t
@@ -21,7 +19,6 @@ from tqdm.notebook import tqdm, trange
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
-from plotly_utils import imshow
 
 OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
 OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
@@ -31,8 +28,6 @@ if not OTHELLO_ROOT.exists():
 
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
     OthelloBoardState, )
-
-from plotting import plot_square_as_board
 
 # Conversion methods
 
@@ -433,153 +428,6 @@ def get_probe_outputs(
     )
     return probe_out
 
-
-@t.inference_mode()
-def plot_aggregate_metric(
-    tokens: Int[Tensor, "batch game_len"],
-    model: HookedTransformer,
-    probe: Optional[Float[Tensor, "d_model rows cols options"]] = None,
-    pos_start: int = 5,
-    pos_end: int = -5,
-    layer: int = 6,
-    per_option: bool = False,
-    per_move: Literal["no", "board_accuracy", "cell_accuracy"] = "no",
-    name: str = "probe",
-    # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None,
-    prediction: Literal["argmax", "softmax", 'logprob'] = "argmax",
-    black_and_white: bool = False,
-    plot: bool = True,
-) -> Float[Tensor, "rows cols *options"]:
-    """
-    Compute and plot an aggregate metric for the given probe.
-
-    Args:
-        tokens (Int[Tensor, "batch game_len"]): the tokenized games on which to evaluate, integers between 0 and 60
-        model (HookedTransformer): the model that is probed
-        probe (Float[Tensor, "d_model rows cols options"]): the probe to use.
-        pos_start (int, optional): The first move to consider. Defaults to 5.
-        pos_end (int, optional): The last move to consider. Defaults to -5.
-        layer (int, optional): The layer of the model to probe. Defaults to 6.
-        per_option (bool, optional): If True, plot the accuracy for blank/mine/theirs separately.
-        per_move (Literal["no", "board_accuracy", "cell_accuracy"], optional): Plot the board or cell accuracy for each move. If 'no', plots per cell.
-        name (str, optional): The name of the probe for the plot.
-        prediction (Literal["argmax", "softmax", 'logprob'], optional): What to plot. 'argmax' plots the accuracy of the argmax, 'softmax' plots the accuracy of the softmax, and 'logprob' plots the log probability of the correct option.
-        black_and_white (bool, optional): If True, consider black/white instead of mine/theirs.
-        plot (bool, optional): If False, do not plot the results.
-    """
-
-    # Compute output
-    out = get_probe_outputs(model, probe, tokens, layer)
-
-    # Compute the expected states
-    mode = 'normal' if black_and_white else 'alternate'
-    states = move_sequence_to_state(tokens_to_board(tokens), mode)
-    correct_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
-    correct_one_hot: Bool[Tensor, "game move row col options"]
-
-    # Remove the first and last moves
-    pos_end = pos_end % tokens.shape[1]
-    out = out[:, pos_start:pos_end]
-    correct_one_hot = correct_one_hot[:, pos_start:pos_end]
-
-    # Transform the probe output into the plotted metric
-    if prediction == 'argmax':
-        probe_values = out.argmax(dim=-1, keepdim=True)
-        metric = t.zeros_like(out)
-        metric.scatter_(-1, probe_values, 1)
-        # correct = (probe_one_hot == states_one_hot).float()
-    elif prediction == 'softmax':
-        metric = out.softmax(dim=-1)
-        # correct[states_one_hot] = probs[states_one_hot]
-        # correct[~states_one_hot] = 1 - probs[~states_one_hot]
-    elif prediction == 'logprob':
-        metric = out.log_softmax(dim=-1)
-    else:
-        raise ValueError(f"Unknown prediction mode: {prediction}")
-
-    if False:
-        # if options_stats is not None:
-        assert (options_stats.shape[0] == 3
-                ), f"options_stats should have 3 stats, got {options_stats.shape}"
-
-        # Compute weighted accuracy
-        weight = einops.rearrange(
-            options_stats[:, pos_start:pos_end].to(model.cfg.device),
-            "stat move row col -> move row col stat",
-        )
-        coeff = 1 / weight
-        coeff = coeff / coeff.sum(dim=-1, keepdim=True)
-        # remove Nan
-        coeff[~t.isfinite(coeff)] = 1
-        metric = metric * coeff
-
-    metric[~correct_one_hot] = 0
-    metric = metric.sum(dim=-1)
-    metric: Float[Tensor, "game move row col"]
-
-    # Reduce the metric to the plot we want
-    if per_move == 'no':
-        # Mean over games and moves
-        metric = metric.mean(dim=(0, 1))
-    elif per_move == "board_accuracy":
-        # Reduce the cell (row+col) dimension
-        if prediction == 'logprob':
-            # Log prob is additive. It annoys me to make a distinction here
-            # but I don't see an other way
-            metric = metric.sum((2, 3))
-        else:
-            # Other metrics are multiplicative
-            metric = metric.prod(3).prod(2)
-        # Mean over games
-        metric = metric.mean(dim=0)
-    elif per_move == "cell_accuracy":
-        # Mean over games and cells
-        metric = metric.mean(dim=(0, 2, 3))
-    else:
-        raise ValueError(f"Unknown per_move: {per_move}")
-
-    # -------------------------------------------------
-    # We computed what we want to plot. Now we plot it.
-    # -------------------------------------------------
-    if not plot:
-        return metric
-
-    # Compute the title of the plot, using `name`, `prediction`, and `per_move`
-    prediction_nice = {
-        'softmax': 'Average probability',
-        'logprob': 'Average log probability',
-        'argmax': 'Average argmax',
-    }[prediction]
-    what = {
-        'no': 'each cell being wrong',
-        'board_accuracy': 'the whole board being correct',
-        'cell_accuracy': 'each cell being correct',
-    }[per_move]
-    title = f"{prediction_nice} of {what} for {name}"
-
-    if per_move == "no":  # Per cell
-        plot_square_as_board(1 - metric, diverging_scale=False, title=title)
-    else:  # Per move
-        if metric.ndim == 1:
-            # If 'board_accuracy' and not per_option
-            metric = metric.unsqueeze(1)
-        labels = ["Correct"]
-        fig = go.Figure()
-        for line, label in zip(metric.T, labels):
-            fig.add_trace(go.Scatter(
-                x=t.arange(pos_start, pos_end),
-                y=line.cpu(),
-                name=label,
-            ))
-        fig.update_layout(
-            title=title,
-            xaxis_title="Move",
-            yaxis_title="Accuracy",
-            legend_title="Option",
-        )
-        fig.show()
-
-    return metric
 
 def zero_ablation_hook(activation: Tensor, hook: HookPoint, head: Optional[int] = None):
     if head is not None:
