@@ -13,6 +13,7 @@ import transformer_lens.utils as utils
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from transformer_lens import HookedTransformer
+from plotting import plot_aggregate_metric
 
 from utils import *
 
@@ -285,10 +286,10 @@ class LitLinearProbe(LightningModule):
 
         acc: Float[Tensor, "move option=3"]
         acc = plot_aggregate_metric(
+            tokens,
             self.model,
             self.linear_probe,
-            tokens,
-            per_option=True,
+            # per_option=True,
             per_move="board_accuracy",
             black_and_white=self.args.black_and_white,
             plot=False,
@@ -296,10 +297,10 @@ class LitLinearProbe(LightningModule):
         acc_per_option = acc.mean(dim=0)
 
         self.log("Validation board accuracy", acc.mean())
-        self.log("Validation board accuracy - blank", acc_per_option[0])
-        self.log("Validation board accuracy - mine", acc_per_option[1])
-        self.log("Validation board accuracy - their", acc_per_option[2])
-        self.log("Validation board accuracy - Move variance", acc.mean(1).var())
+        # self.log("Validation board accuracy - blank", acc_per_option[0])
+        # self.log("Validation board accuracy - mine", acc_per_option[1])
+        # self.log("Validation board accuracy - their", acc_per_option[2])
+        # self.log("Validation board accuracy - Move variance", acc.mean(1).var())
 
         return acc.mean()
 
@@ -308,7 +309,7 @@ class LitLinearProbe(LightningModule):
 
         states = move_sequence_to_state(
             TOKENS_TO_BOARD[tokens],
-            "normal" if self.args.black_and_white else "alternate",
+            "black-white" if self.args.black_and_white else "mine-their",
         ).to(device)
 
         return tokens.to(device), states

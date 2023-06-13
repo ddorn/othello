@@ -267,7 +267,7 @@ def plot_aggregate_metric(
     out = get_probe_outputs(model, probe, tokens, layer)
 
     # Compute the expected states
-    mode = "normal" if black_and_white else "alternate"
+    mode = "black-white" if black_and_white else "mine-their"
     states = move_sequence_to_state(tokens_to_board(tokens), mode)
     correct_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
     correct_one_hot: Bool[Tensor, "game move row col options"]

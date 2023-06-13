@@ -205,7 +205,7 @@ def move_sequence_to_state(
         Float[Tensor, "batch moves rows=8 cols=8"]: the board states
     """
     assert len(moves_board_index.shape) == 2
-    assert mode in ("valid", "black-white", "mine-their", "turn")
+    assert mode in ("valid", "black-white", "mine-their", "turn"), f"Unkown mode: {mode}"
 
     # Speed up the computation by doing it in parallel
     nb_games = moves_board_index.shape[0]
