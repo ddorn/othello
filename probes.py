@@ -31,7 +31,7 @@ PROBE_DIR.mkdir(exist_ok=True)
 def get_probe(n: int = 0,
               flip_mine: bool = False,
               device="cpu",
-              base_name='orthogonal_probe') -> Float[Tensor, "d_model rows cols options"]:
+              base_name="orthogonal_probe") -> Float[Tensor, "d_model rows cols options"]:
     """
     Load the probes that I trained.
 
@@ -153,12 +153,10 @@ class ProbeTrainingArgs:
 
     def __post_init__(self):
         assert self.pos_start < self.pos_end, "pos_start should be smaller than pos_end"
-        assert (
-            self.train_tokens
-            < 61).all(), f"Train tokens should be between 0 and 60, got {self.train_tokens.max()}"
-        assert (
-            self.valid_tokens
-            < 61).all(), f"Valid tokens should be between 0 and 60, got {self.valid_tokens.max()}"
+        assert (self.train_tokens < 61).all(), (
+            f"Train tokens should be between 0 and 60, got {self.train_tokens.max()}")
+        assert (self.valid_tokens < 61).all(), (
+            f"Valid tokens should be between 0 and 60, got {self.valid_tokens.max()}")
 
     def setup_linear_probe(self,
                            model: HookedTransformer) -> Float[Tensor, "d_model rows cols options"]:
@@ -212,7 +210,6 @@ class LitLinearProbe(LightningModule):
         self.dataset_stats = None
 
         pl.seed_everything(42, workers=True)
-
 
     # def training_step(self, batch: Int[Tensor, "game_idx"], batch_idx: int) -> t.Tensor:
     def training_step(
@@ -306,12 +303,13 @@ class LitLinearProbe(LightningModule):
 
         return acc.mean()
 
-    def make_dataset(self, tokens: Float[Tensor, 'game move']):
+    def make_dataset(self, tokens: Float[Tensor, "game move"]):
         device = self.model.cfg.device
 
         states = move_sequence_to_state(
             TOKENS_TO_BOARD[tokens],
-            'normal' if self.args.black_and_white else 'alternate').to(device)
+            "normal" if self.args.black_and_white else "alternate",
+        ).to(device)
 
         return tokens.to(device), states
 

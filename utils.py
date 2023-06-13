@@ -2,7 +2,7 @@
 import os
 import random
 from dataclasses import dataclass
-from functools import cached_property, partial, wraps
+from functools import partial
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple, Union
 import joblib
@@ -18,7 +18,6 @@ from torch import Tensor
 from tqdm.notebook import tqdm, trange
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
-
 
 OTHELLO_ROOT = (Path(__file__).parent / "othello_world").resolve()
 OTHELLO_MECHINT_ROOT = (OTHELLO_ROOT / "mechanistic_interpretability").resolve()
@@ -550,7 +549,7 @@ GAME_VALID_MOVES_PATH = DATA_DIR / "games_valid_moves.pt"
 def make_training_data(
     n: int = 100,
     seed: int = 42,
-) -> (Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]):
+) -> Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]:
     """Generate the training data and save it to disk.
 
     Returns:
@@ -611,9 +610,9 @@ def compute_stats(
     if games_valid_moves is None:
         games_valid_moves = [None] * n_games
     else:
-        assert games_valid_moves.device == games_states.device, (
-            f"games_valid_moves.device ({games_valid_moves.device}) != games_states.device ({games_states.device})"
-        )
+        assert (
+            games_valid_moves.device == games_states.device
+        ), f"games_valid_moves.device ({games_valid_moves.device}) != games_states.device ({games_states.device})"
 
     stats = t.zeros(n_stats, 60, 8, 8, device=games_states.device)
     for board_states, valid_moves in tqdm(

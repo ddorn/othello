@@ -121,7 +121,7 @@ class ModelMetricPlotter:
 
     @cached_property
     def expected(self) -> Bool[Tensor, "game move cell"]:
-        is_valid = move_sequence_to_state(tokens_to_board(self.tokens), 'valid')
+        is_valid = move_sequence_to_state(tokens_to_board(self.tokens), "valid")
         return is_valid[:, self.focus_moves].flatten(start_dim=-2)
 
     @cached_property
@@ -158,13 +158,14 @@ class ModelMetricPlotter:
         metric[~self.expected] = 1 - metric[~self.expected]
         return metric
 
-    def reduce(self, metric: Float[Tensor, "game move *cell"], mode: str = 'per_move') -> None:
+    def reduce(self, metric: Float[Tensor, "game move *cell"], mode: str = "per_move") -> None:
         if metric.ndim != 3:
-            assert mode == 'per_move', f"Can only reduce per_move for 3-dim tensors, got {metric.shape}"
+            assert (mode == "per_move"
+                    ), f"Can only reduce per_move for 3-dim tensors, got {metric.shape}"
             return metric.mean(0)
 
         # Reduce the metric to the plot we want
-        if mode == 'per_cell':  # -> 8x8
+        if mode == "per_cell":  # -> 8x8
             metric = metric.mean(dim=(0, 1)).reshape(8, 8)
         elif mode == "per_move":  # -> moves
             metric = metric.mean(dim=(0, 2))
@@ -180,29 +181,31 @@ class ModelMetricPlotter:
     # Different plots
 
     def plot_loss_per_move(self, rescaled: bool = False, name: str = "OthelloGPT"):
-        title = 'Loss scaled by nb of valid moves' if rescaled else 'Loss'
+        title = "Loss scaled by nb of valid moves" if rescaled else "Loss"
         self.plot_by_move(
             f"{title} of {name}",
             [title],
-            self.reduce(self.loss_scaled if rescaled else self.loss, 'per_move'),
+            self.reduce(self.loss_scaled if rescaled else self.loss, "per_move"),
             yaxis_title="Loss",
         )
 
-    def plot_by_move(self,
-                   title: str,
-                   labels: List[str],
-                     *lines: Float[Tensor, "x"],
-                   yaxis_title: str = "Accuracy",
-                   ):
+    def plot_by_move(
+        self,
+        title: str,
+        labels: List[str],
+        *lines: Float[Tensor, "x"],
+        yaxis_title: str = "Accuracy",
+    ):
         assert len(labels) == len(lines), f"Got {len(labels)} labels and {len(lines)} lines"
 
         fig = go.Figure()
         for line, label in zip(lines, labels):
-            fig.add_trace(go.Scatter(
-                x=t.arange(self.pos_start, self.pos_end % self.tokens.shape[1]),
-                y=line.cpu(),
-                name=label,
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=t.arange(self.pos_start, self.pos_end % self.tokens.shape[1]),
+                    y=line.cpu(),
+                    name=label,
+                ))
         fig.update_layout(
             title=title,
             xaxis_title="Move",
@@ -224,7 +227,7 @@ def plot_aggregate_metric(
     per_move: Literal["no", "board_accuracy", "cell_accuracy"] = "no",
     name: str = "probe",
     # options_stats: Optional[Float[Tensor, "stat=3 move row col"]] = None,
-    prediction: Literal["argmax", "softmax", 'logprob'] = "argmax",
+    prediction: Literal["argmax", "softmax", "logprob"] = "argmax",
     black_and_white: bool = False,
     plot: bool = True,
 ) -> Float[Tensor, "rows cols *options"]:
@@ -250,7 +253,7 @@ def plot_aggregate_metric(
     out = get_probe_outputs(model, probe, tokens, layer)
 
     # Compute the expected states
-    mode = 'normal' if black_and_white else 'alternate'
+    mode = "normal" if black_and_white else "alternate"
     states = move_sequence_to_state(tokens_to_board(tokens), mode)
     correct_one_hot = state_stack_to_one_hot(states.to(model.cfg.device))
     correct_one_hot: Bool[Tensor, "game move row col options"]
@@ -261,16 +264,16 @@ def plot_aggregate_metric(
     correct_one_hot = correct_one_hot[:, pos_start:pos_end]
 
     # Transform the probe output into the plotted metric
-    if prediction == 'argmax':
+    if prediction == "argmax":
         probe_values = out.argmax(dim=-1, keepdim=True)
         metric = t.zeros_like(out)
         metric.scatter_(-1, probe_values, 1)
         # correct = (probe_one_hot == states_one_hot).float()
-    elif prediction == 'softmax':
+    elif prediction == "softmax":
         metric = out.softmax(dim=-1)
         # correct[states_one_hot] = probs[states_one_hot]
         # correct[~states_one_hot] = 1 - probs[~states_one_hot]
-    elif prediction == 'logprob':
+    elif prediction == "logprob":
         metric = out.log_softmax(dim=-1)
     else:
         raise ValueError(f"Unknown prediction mode: {prediction}")
@@ -296,12 +299,12 @@ def plot_aggregate_metric(
     metric: Float[Tensor, "game move row col"]
 
     # Reduce the metric to the plot we want
-    if per_move == 'no':
+    if per_move == "no":
         # Mean over games and moves
         metric = metric.mean(dim=(0, 1))
     elif per_move == "board_accuracy":
         # Reduce the cell (row+col) dimension
-        if prediction == 'logprob':
+        if prediction == "logprob":
             # Log prob is additive. It annoys me to make a distinction here
             # but I don't see an other way
             metric = metric.sum((2, 3))
@@ -324,14 +327,14 @@ def plot_aggregate_metric(
 
     # Compute the title of the plot, using `name`, `prediction`, and `per_move`
     prediction_nice = {
-        'softmax': 'Average probability',
-        'logprob': 'Average log probability',
-        'argmax': 'Average argmax',
+        "softmax": "Average probability",
+        "logprob": "Average log probability",
+        "argmax": "Average argmax",
     }[prediction]
     what = {
-        'no': 'each cell being wrong',
-        'board_accuracy': 'the whole board being correct',
-        'cell_accuracy': 'each cell being correct',
+        "no": "each cell being wrong",
+        "board_accuracy": "the whole board being correct",
+        "cell_accuracy": "each cell being correct",
     }[per_move]
     title = f"{prediction_nice} of {what} for {name}"
 
@@ -358,7 +361,6 @@ def plot_aggregate_metric(
         fig.show()
 
     return metric
-
 
 
 __all__ = [
