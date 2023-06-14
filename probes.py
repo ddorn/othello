@@ -52,7 +52,7 @@ def get_probe(n: int = 0,
 
     path = PROBE_DIR / f"{base_name}_{n}.pt"
     if not path.exists():
-        valid_probes = list(PROBE_DIR.glob("orthogonal_probe_*.pt"))
+        valid_probes = list(PROBE_DIR.glob(f"{base_name}_*.pt"))
         if len(valid_probes) == 0:
             raise FileNotFoundError(f"Could not find any probes in {PROBE_DIR}.")
         raise FileNotFoundError(f"Could not find probe {n} in {PROBE_DIR}. "
