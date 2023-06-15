@@ -471,6 +471,47 @@ def find_failed_predictions(
         # plot_board(TOKENS_TO_BOARD[tokens[game]])
 
 
+def logit_attribution_emb_ov_circuit(model: HookedTransformer,
+                                     layer: int = 0,
+                                     include_out_bias: bool = False,
+                                     include_unembed_bias: bool = False,
+                                     ignore_pass: bool = False) -> None:
+    """
+    Show the direct logit attribution of the token embedding through the OV circuit of a layer.
+
+    The bias terms are are expluded by default, because they are constant and do not interact with the embeddings.
+    They are also the same for avery head. If included, remember this when interpreting the plot.
+
+    Args:
+        model (HookedTransformer): The model.
+        layer (int, optional): Plot the OV circuit of the heads of this layer. Defaults to 0.
+        include_out_bias (bool, optional): Whether to include the output bias (b_O).
+        include_unembed_bias (bool, optional): Whether to include the unembedding bias (b_U).
+        ignore_pass (bool, optional): Whether to plot information about the pass token. Defaults to False.
+    """
+    # We * Wov * Wu
+    out = model.W_E @ model.W_V[layer] @ model.W_O[layer]
+    if include_out_bias:
+        out += model.b_O[layer]
+    out = out @ model.W_U
+    if include_unembed_bias:
+        out += model.b_U
+
+    if ignore_pass:
+        out[:, 0] = 0
+        out[:, :, 0] = 0
+
+    imshow(
+        out,
+        facet_col=0,
+        facet_col_wrap=3,
+        height=1200,
+        x=TOKEN_NAMES,
+        y=TOKEN_NAMES,
+        title=f"Direct logit attribution of the embedding through the OV circuit of layer {layer}",
+    )
+
+
 __all__ = [
     "plot_square_as_board",
     "plot_similarities",
@@ -480,4 +521,5 @@ __all__ = [
     "plot_aggregate_metric",
     "find_failed_predictions",
     "explain_game",
+    "logit_attribution_emb_ov_circuit",
 ]

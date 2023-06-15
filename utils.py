@@ -62,9 +62,11 @@ def to_board_label(board_index: int) -> str:
 
 
 # Get our list of board labels
-board_labels = list(map(to_board_label, TOKENS_TO_BOARD[1:]))
-"""Map from token index to board label, e.g. `E2`. 0 ≤ i < 60"""
-full_board_labels = list(map(to_board_label, range(64)))
+CELL_TOKEN_NAMES = list(map(to_board_label, TOKENS_TO_BOARD[1:]))
+"""Map from token index to board label, exclude `pass`. e.g. `E2`. 0 ≤ i < 60"""
+TOKEN_NAMES = ["pass"] + CELL_TOKEN_NAMES
+"""Map from token index to token name, e.g. `pass`, `E2`. 0 ≤ i < 61"""
+FULL_BOARD_LABELS = list(map(to_board_label, range(64)))
 """Map from token index to board label, e.g. `E2`. 0 ≤ i < 64"""
 
 
