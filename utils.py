@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import transformer_lens.utils as utils
 from IPython.display import display
 from jaxtyping import Bool, Float, Int
-from torch import Tensor
+from torch import Tensor, fill
 from tqdm.notebook import tqdm, trange
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
@@ -73,9 +73,15 @@ FULL_BOARD_LABELS = list(map(to_board_label, range(64)))
 def logits_to_board(
     logits: Float[Tensor, "... 61"],
     mode: Literal["log_prob", "prob", "logits"],
+    fill_value: Optional[float] = None,
 ) -> Float[Tensor, "... rows=8 cols=8"]:
     """
     Convert a set of logits into a board state, with each cell being a log prob/prob/logits of that cell being played.
+
+    Args:
+        logits (Float[Tensor, "... 61"]): the logits to convert
+        mode (Literal["log_prob", "prob", "logits"]): convert to log prob, prob, or leave as logits
+        fill_value (Optional[float], optional): If not None, fill the middle cells with this value. Defaults to 0 for prob, -13 for log prob/logits.
 
     Returns:
         A tensor of shape `(..., 8, 8)`
@@ -94,8 +100,12 @@ def logits_to_board(
     temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
     temp_board_state[..., TOKENS_TO_BOARD[1:]] = x
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
-    if mode in ("log_prob", "logits"):
-        temp_board_state[..., [27, 28, 35, 36]] = -13
+    if mode in ("log_prob", "logits") and fill_value is None:
+        fill_value = -13
+
+    if fill_value is not None:
+        temp_board_state[..., [27, 28, 35, 36]] = fill_value
+
     return temp_board_state.reshape(*extra_shape, 8, 8)
 
 
