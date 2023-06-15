@@ -53,6 +53,8 @@ def board_label_to_row_col(label: str) -> Tuple[int, int]:
 
 def to_board_label(board_index: int) -> str:
     """Convert an index into a board label, e.g. `E2`. 0 ≤ i < 64"""
+    if isinstance(board_index, t.Tensor):
+        board_index = board_index.item()
     row = board_index // 8
     col = board_index % 8
     assert 0 <= row <= 7, f"Expected 0 ≤ row ≤ 7, got {row}"

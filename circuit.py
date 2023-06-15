@@ -1,10 +1,10 @@
-# %%
 from typing import Callable, Iterable, List, Dict, Union, Optional, Tuple, Literal, Self
 import plotly.express as px
 import torch
 import einops
 from torch import Tensor
 from transformer_lens import HookedTransformer
+from jaxtyping import Int, Float, Bool
 from dataclasses import dataclass, field
 
 from utils import logits_to_board, TOKEN_NAMES, CELL_TOKEN_NAMES
@@ -25,7 +25,10 @@ class Kuit:
     value: Tensor = field(default_factory=lambda: torch.tensor(1))
     _shape: List[str] = field(default_factory=lambda: [])
 
-    LABELS = {}
+    BATCH_NAMES = {'batch', 'game'}
+
+    def __post_init__(self) -> None:
+        assert self.value.ndim == len(self._shape), f"Shape {self._shape} does not match value shape {self.value.shape}"
 
     def __repr__(self) -> str:
         shape = ', '.join(f'{dim}={size}' for dim, size in zip(self._shape, self.value.shape))
@@ -53,7 +56,7 @@ class Kuit:
 
     # Functions to manipulate the dimensions order/names
 
-    def rearange(self, new_shape: List[str]):
+    def rearange(self, new_shape: List[str]) -> Self:
         value = einops.rearrange(self.value, f"{' '.join(self._shape)} -> {' '.join(new_shape)}")
         return self.edited(value, new_shape)
 
@@ -119,9 +122,11 @@ class Kuit:
             assert len(self._shape
                        ) == 1, f"Implicit dimention is possible only for 1D tensor. Got: {self}."
             return 0
-        else:
+        elif isinstance(dim, str):
             assert dim in self._shape, f"Dimension {dim} not in {self._shape}"
             return self._shape.index(dim)
+        else:
+            raise ValueError(f"Invalid dimension type: {type(dim)}")
 
     def _get_shape_without(self,
                            dim: Optional[Union[str, int]] = None,
@@ -167,6 +172,28 @@ class Kuit:
 
         return self.edited(self.value[indexing], new_shape)
 
+    def tokens_to_board(self, dim: Optional[str] = None, fill: float = 0) -> Self:
+        """Convert the given dimension to two dimensions, row and col.
+
+        If no dimension is given, use only one that starts with "vocab".
+        """
+        assert "row" not in self._shape, f"Cannot convert to board, already has a row dimension"
+        assert "col" not in self._shape, f"Cannot convert to board, already has a col dimension"
+
+        vocab_dims = [d for d in self._shape if d.startswith("vocab")]
+        if dim is None:
+            assert len(vocab_dims) == 1, f"Cannot infer which dimension to use: {vocab_dims}"
+            dim = vocab_dims[0]
+        else:
+            assert dim in vocab_dims, f"Dimension {dim} not a vocabulary dimension. Options: {vocab_dims}"
+
+        # move the dimension to the end
+        out = self.by(dim, last=True)
+
+        value = logits_to_board(out.value, 'logits', fill_value=fill)
+        return out.edited(value, out._shape[:-1] + ['row', 'col'])
+
+
     # Leafs of the computation graph (input and output)
 
     def embedding(self, normalize: bool = False) -> Self:
@@ -184,12 +211,18 @@ class Kuit:
         else:
             return self._mul(we, ["vocab", "dmodel"])
 
-    def pos_embedding(self, normalize: bool = False) -> Self:
+    def pos_embedding(self, normalize: bool = False, max_pos: Optional[int] = None) -> Self:
         """Multiply self with the positional embedding matrix.
+
+        Args:
+            normalize (bool, optional): If True, normalize the positional embedding. Useful to simulate a layernorm.
+            max_pos (Optional[int], optional): If given, only use the first max_pos positions.
 
         New dimensions: pos, dmodel. Possibly "pos_1", "pos_2" if multiplying along dmodel and self has a pos dimension.
         """
         pos = self.model.W_pos
+        if max_pos is not None:
+            pos = pos[:max_pos]
         if normalize:
             pos = pos / pos.norm(dim=1, keepdim=True)
 
@@ -222,6 +255,22 @@ class Kuit:
             return self.edited(self.model.b_U, ["vocab_out"])
         return self.add(Kuit(self.model, self.model.b_U, ["vocab_out"]))
 
+    def embed(self, tokens: Int[Tensor, '*game token'],
+              positional: bool = True,
+        ) -> Self:
+        """Embed the given tokens."""
+
+        assert tokens.ndim < 4, f"Cannot embed {tokens.shape}, too many dimensions"
+        tokens = tokens.to(self.model.cfg.device)
+        embedded = self.model.W_E[tokens]
+
+        if positional:
+            print(embedded.shape, self.model.W_pos.shape)
+            embedded += self.model.W_pos[:embedded.shape[-2]]
+
+        shape = ['game', 'pos', 'dmodel'][-len(embedded.shape):]
+        return self._mul(embedded, shape)
+
     # Functions of arrity 1
 
     def ov(self, layer: int, head: Optional[int] = None) -> Self:
@@ -240,11 +289,13 @@ class Kuit:
             dims_o = ["dhead", "dmodel"]
 
         out = self._mul(self.model.W_V[index], dims_v)
-        out = out._mul(self.model.W_O[index], dims_o, self.model.b_O[index])
-        return out.add(Kuit(self.model, self.model.b_O[index], ["dmodel"]))
+        out = out._mul(self.model.W_O[index], dims_o, prefered_dim='dhead')
+        return out.add(Kuit(self.model, self.model.b_O[layer], ["dmodel"]))
 
     def softmax(self, dim: Optional[str] = None) -> Self:
         """Apply softmax along the given dimension."""
+        if dim is None and "pos_k" in self._shape:
+            dim = "pos_k"
         dim_index = self._dim_name_to_index(dim)
         return self.edited(self.value.softmax(dim=dim_index))
 
@@ -401,7 +452,7 @@ class Kuit:
 
         # Combine the two
         # Find the intersection of the two shapes
-        possible_multiplied_dims = set(query._shape) & set(key._shape) - {'dhead', 'head', 'layer'}
+        possible_multiplied_dims = set(query._shape) & set(key._shape) - {'dhead', 'head', 'layer'} - self.BATCH_NAMES
         # We always want to match the head dimension, and there might be an other dimension
         # that is shared between the two, which we dont want to match
         query._shape = [d + "_q" if d in possible_multiplied_dims else d for d in query._shape]
@@ -443,27 +494,6 @@ class Kuit:
                                        f"{' '.join(other._shape)} -> {' '.join(other_new_shape)}")
 
         return self.edited(self.value + other_value)
-
-    def tokens_to_board(self, dim: Optional[str] = None, fill: float = 0) -> Self:
-        """Convert the given dimension to two dimensions, row and col.
-
-        If no dimension is given, use only one that starts with "vocab".
-        """
-        assert "row" not in self._shape, f"Cannot convert to board, already has a row dimension"
-        assert "col" not in self._shape, f"Cannot convert to board, already has a col dimension"
-
-        vocab_dims = [d for d in self._shape if d.startswith("vocab")]
-        if dim is None:
-            assert len(vocab_dims) == 1, f"Cannot infer which dimension to use: {vocab_dims}"
-            dim = vocab_dims[0]
-        else:
-            assert dim in vocab_dims, f"Dimension {dim} not a vocabulary dimension. Options: {vocab_dims}"
-
-        # move the dimension to the end
-        out = self.by(dim, last=True)
-
-        value = logits_to_board(self.value, 'logits', fill_value=fill)
-        return out.edited(value, self._shape[:-1] + ['row', 'col'])
 
     def histogram(self, **kwargs) -> Self:
         return self.plot('histogram', **kwargs)
@@ -554,5 +584,3 @@ if __name__ == "__main__":
     c.embedding().plot()
 
     c.unembed().by('dmodel').plot(height=800)
-
-# %%
