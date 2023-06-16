@@ -1,33 +1,34 @@
-from typing import Callable, Iterable, List, Dict, Union, Optional, Tuple, Literal, Self
+from typing import Callable, Iterable, List, Dict, Union, Optional, Tuple, Literal
 import plotly.express as px
 import torch
 import einops
 from torch import Tensor
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, utils
 from jaxtyping import Int, Float, Bool
 from dataclasses import dataclass, field
 
 from utils import logits_to_board, TOKEN_NAMES, CELL_TOKEN_NAMES
-from plotly_utils import imshow, line
+from plotly_utils import hist, imshow, line
+
+try:
+    from typing import Self
+except ImportError:
+    Self = "Kuit"
 
 
-@dataclass
-class Kuit:
+class MagicTensor:
     """
-    Circuit is a class useful to compute sub-parts of a transformer model.
-
-    It is a wrapper around a tensor, with named dimensions,
-    and all method return a new circuit with the modification applied,
-    usually deducing the dimensions along which to multiply tensors.
+    MagicTensor is a tensor that wraps a tensor with named dimensions,
+    manipulating the dimensions automatically.
     """
 
-    model: HookedTransformer
-    value: Tensor = field(default_factory=lambda: torch.tensor(1))
-    _shape: List[str] = field(default_factory=lambda: [])
+    value: Tensor
+    _shape: List[str]
 
-    BATCH_NAMES = {'batch', 'game'}
+    def __init__(self, value: Tensor, shape: List[str]) -> None:
+        self.value = value
+        self._shape = shape
 
-    def __post_init__(self) -> None:
         assert self.value.ndim == len(self._shape), f"Shape {self._shape} does not match value shape {self.value.shape}"
 
     def __repr__(self) -> str:
@@ -46,13 +47,11 @@ class Kuit:
             print(self)
         return self
 
-    def edited(self, value: Optional[Tensor], shape: Optional[List[str]] = None) -> Self:
+    def edited(self, value: Tensor, shape: Optional[List[str]] = None) -> Self:
         """Return a new circuit with the given value and shape. If not given, use the current shape."""
         if shape is None:
             shape = self._shape
-        assert len(shape) == len(
-            value.shape), f"Shape {shape} does not match value shape {value.shape}"
-        return self.__class__(self.model, value, shape)
+        return self.__class__(value, shape)
 
     # Functions to manipulate the dimensions order/names
 
@@ -193,6 +192,256 @@ class Kuit:
         value = logits_to_board(out.value, 'logits', fill_value=fill)
         return out.edited(value, out._shape[:-1] + ['row', 'col'])
 
+    # Functions of arrity 1
+
+    def softmax(self, dim: Optional[str] = None) -> Self:
+        """Apply softmax along the given dimension."""
+        dim_index = self._dim_name_to_index(dim)
+        return self.edited(self.value.softmax(dim=dim_index))
+
+    def norm(self, dim: Optional[str] = None, keepdim: bool = False) -> Self:
+        """Compute the norm along the given dimension."""
+        dim_index = self._dim_name_to_index(dim)
+        new_shape = self._get_shape_without(dim, keepdim)
+        value = torch.linalg.vector_norm(self.value, dim=dim_index, keepdim=keepdim)
+        return self.edited(value, new_shape)
+
+    def normalise(self, dim: Optional[str] = None) -> Self:
+        """Normalise the tensor along the given dimension."""
+        dim_index = self._dim_name_to_index(dim)
+        return self.edited(self.value / self.value.norm(dim=dim_index, keepdim=True))
+
+    def remove_diag(self) -> Self:
+        """Set the diagonal of the last two dimensions to 0."""
+        assert len(self._shape) >= 2, f"Cannot remove diag of {self}, not enough dimensions"
+        assert self.value.shape[-1] == self.value.shape[
+            -2], f"Cannot remove diag of {self}, last two dimensions are not equal"
+        return self.edited(self.value - self.value.diag().diag())
+
+    def flatten(self, *dims: str, new_name: Optional[str] = None) -> Self:
+        """Flatten the two dimensions into one"""
+        for dim in dims:
+            assert dim in self._shape, f"Dimension {dim} not in {self._shape}"
+        assert len(set(dims)) == len(dims), f"Repeated dimensions in {dims}"
+
+        if not dims:
+            dims = self._shape
+        elif len(dims) == 1:
+            raise ValueError(f"Cannot flatten only one dimension: {dims}")
+
+        # Put the dimensions at the end
+        out = self.by(*dims, last=True)
+
+        if new_name is None:
+            new_name = f"flat_{'_'.join(dims)}"
+        new_shape = out._shape[:-len(dims)] + [new_name]
+        value = self.value.flatten(len(new_shape) - 1)
+
+        return out.edited(value, new_shape)
+
+    def sum(self, dim: Optional[str] = None, keepdim: bool = False) -> Self:
+        """Sum along the given dimension."""
+        dim_index = self._dim_name_to_index(dim)
+        new_shape = self._get_shape_without(dim, keepdim)
+        return self.edited(self.value.sum(dim=dim_index, keepdim=keepdim), new_shape)
+
+    def apply(self, func: Callable[[Tensor], Tensor]) -> Self:
+        """Apply a function to the tensor."""
+        out = func(self.value)
+        assert out.shape == self.value.shape, f"Function changed the shape of {self} to {out.shape}. Shape must be kept."
+        return self.edited(out)
+
+    def __call__(self, func: Callable[[Tensor], Tensor]) -> Self:
+        """Apply a function to the tensor."""
+        return self.apply(func)
+
+    # Functions of arriy 2
+
+    def _mul(self,
+             other: Tensor,
+             other_shape: List[str],
+             bias: Optional[Tensor] = None,
+             prefered_dim: Optional[str] = None) -> Self:
+        """Multiply the tensor with another one, automatically finding the dimension to multiply.
+
+        Args:
+            other (Tensor): The other tensor to multiply with.
+            other_shape (List[str]): The shape of the other tensor.
+            bias (Optional[Tensor], optional): Optianally add a bias. Bias is assumed to have the same shape as other, except for the dim that is multiplied.
+            prefered_dim (Optional[str], optional): If given, use this dimension to multiply (according to Circuit._prefered_dim).
+
+        Returns:
+            Self: self * other + bias
+        """
+
+        # Check that the other shape is coherent
+        assert len(other.shape) == len(
+            other_shape), f"Shape {other_shape} does not match value shape {other.shape}"
+        # Check that no dim is repeated in each tensor
+        assert len(set(self._shape)) == len(self._shape), f"Repeated dimensions in {self._shape}"
+        assert len(set(other_shape)) == len(other_shape), f"Repeated dimensions in {other_shape}"
+
+        if not self._shape:  # 0D tensor
+            return self.edited(self.value * other, other_shape)
+
+        # Find the dimension on which to multiply
+        possible_multiplied_dims = set(self._shape) & set(other_shape)
+        dim = self._prefered_dim(possible_multiplied_dims, prefered_dim)
+
+        pattern_1 = " ".join(self._shape)
+        pattern_2 = " ".join(other_shape)
+
+        shape = [d for d in self._shape if d != dim
+                 ] + [d for d in other_shape if d not in possible_multiplied_dims]
+        pattern_target = ' '.join(shape)
+
+        value = einops.einsum(
+            self.value,
+            other,
+            f"{pattern_1}, {pattern_2} -> {pattern_target}",
+        )
+
+        if bias is not None:
+            bias_shape = [d for d in other_shape if d != dim]
+            assert len(bias.shape) == len(
+                bias_shape), f"Shape {bias_shape} does not match value shape {bias.shape}"
+            target_shape = [d if d in bias_shape else "1" for d in shape]  # broadcast the bias
+            bias = einops.rearrange(bias, f"{' '.join(bias_shape)} -> {' '.join(target_shape)}")
+            value += bias
+
+        return self.edited(value, shape)
+    def add(self, other: Self) -> Self:
+        """Add the value of the other circuit to this one.
+
+        One of the shape must be a subset of the other. The addition broadcast on the other dims.
+        See also: Circuit.new_dim to extend a shape.
+        """
+        assert self.model is other.model, "Both circuits must have the same model"
+
+        # We keep the one with the largest number of dimensions
+        if len(self._shape) < len(other._shape):
+            return other.add(self)
+
+        assert set(other.shape) <= set(self.shape), f"Cannot add {other.shape} to {self.shape}"
+
+        other_new_shape = [d if d in other._shape else "1" for d in self._shape]
+        other_value = einops.rearrange(other.value,
+                                       f"{' '.join(other._shape)} -> {' '.join(other_new_shape)}")
+
+        return self.edited(self.value + other_value)
+
+    def histogram(self, **kwargs) -> Self:
+        return self.plot('histogram', **kwargs)
+
+    def line(self, **kwargs) -> Self:
+        return self.plot('line', **kwargs)
+
+    def plot(self, plot_type: Literal['imshow', 'line', 'histogram'] = 'imshow', **kwargs) -> Self:
+        """Plot the tensor!
+
+        TODO: Document how the plot is made.
+        """
+
+        if self.value.ndim == 1 and plot_type == 'imshow':
+            plot_type = 'line'
+
+        dim_plot = 2 if plot_type == 'imshow' else 1
+
+        if len(self._shape) > dim_plot:
+            facet_dim = (-dim_plot - 1) % len(self._shape)
+            facet_name = self._shape[facet_dim]
+            nb_plots = self.value.shape[facet_dim]
+            kwargs.setdefault('facet_col', facet_dim)
+            if 'facet_col_wrap' in kwargs:
+                wrap = kwargs['facet_col_wrap']
+            elif nb_plots < 4:
+                wrap = nb_plots
+            elif nb_plots == 4:
+                wrap = 2
+            else:
+                wrap = 3
+            kwargs.setdefault('facet_col_wrap', wrap)
+            kwargs.setdefault('height', 500 * (nb_plots // wrap))
+
+            if facet_name.startswith('head'):
+                kwargs.setdefault('facet_labels', [f"Head {i}" for i in range(nb_plots)])
+            elif facet_name.startswith('layer'):
+                kwargs.setdefault('facet_labels', [f"Layer {i}" for i in range(nb_plots)])
+            else:
+                print(f"Warning: Don't know how to label {facet_name}")
+
+        if len(self._shape) == dim_plot + 2:
+            kwargs.setdefault('animation_frame', 0)
+        elif len(self._shape) > dim_plot + 2:
+            raise ValueError(f"Cannot plot {self}: Too many dimensions.")
+
+        kwargs.setdefault('title', str(self))
+
+        if plot_type == 'histogram':
+            from rich import print as rprint
+            rprint(kwargs)
+            px.histogram(x=utils.to_numpy(self.value), **kwargs).show()
+            return self
+
+        x_name = self._shape[-1]
+        kwargs.setdefault('xaxis_title', x_name)
+        if x_name.startswith('vocab'):
+            if self.shape[x_name] == len(TOKEN_NAMES):
+                kwargs.setdefault('x', TOKEN_NAMES)
+            elif self.shape[x_name] == len(CELL_TOKEN_NAMES):
+                kwargs.setdefault('x', CELL_TOKEN_NAMES)
+
+        if plot_type == 'imshow':
+            y_name = self._shape[-2]
+            kwargs.setdefault('yaxis_title', y_name)
+            if y_name.startswith('vocab'):
+                if self.shape[y_name] == len(TOKEN_NAMES):
+                    kwargs.setdefault('y', TOKEN_NAMES)
+                elif self.shape[y_name] == len(CELL_TOKEN_NAMES):
+                    kwargs.setdefault('y', CELL_TOKEN_NAMES)
+
+            try:
+                imshow(self.value, **kwargs)
+            except Exception as e:
+                print("Error while plotting", self)
+                raise
+
+        elif plot_type == 'line':
+            # kwargs.setdefault('xaxis', x_name)
+            kwargs.setdefault('xaxis_title', x_name)
+            line(self.value, **kwargs)
+        else:
+            raise ValueError(f"Unknown type: {plot_type}")
+        return self
+
+
+class Kuit(MagicTensor):
+    """
+    Circuit is a class useful to compute sub-parts of a transformer model.
+
+    It is a wrapper around a tensor, with named dimensions,
+    and all method return a new circuit with the modification applied,
+    usually deducing the dimensions along which to multiply tensors.
+    """
+
+    model: HookedTransformer
+
+    BATCH_NAMES = {'batch', 'game'}
+
+    def __init__(self, model: HookedTransformer, value: Optional[Tensor] = None, shape: Optional[List[str]] = None) -> None:
+        self.model = model
+        if shape is None:
+            shape = []
+        if value is None:
+            value = torch.tensor(1.0, device=model.cfg.device)
+        super().__init__(value, shape)
+
+    def edited(self, value: Tensor, shape: Optional[List[str]] = None) -> Self:
+        """Return a new circuit with the given value and shape. If not given, use the current shape."""
+        if shape is None:
+            shape = self._shape
+
+        return self.__class__(self.model, value, shape)
 
     # Leafs of the computation graph (input and output)
 
@@ -271,7 +520,7 @@ class Kuit:
         shape = ['game', 'pos', 'dmodel'][-len(embedded.shape):]
         return self._mul(embedded, shape)
 
-    # Functions of arrity 1
+    # Specific circuits
 
     def ov(self, layer: int, head: Optional[int] = None) -> Self:
         """Pass through the OV circuit.
@@ -291,124 +540,6 @@ class Kuit:
         out = self._mul(self.model.W_V[index], dims_v)
         out = out._mul(self.model.W_O[index], dims_o, prefered_dim='dhead')
         return out.add(Kuit(self.model, self.model.b_O[layer], ["dmodel"]))
-
-    def softmax(self, dim: Optional[str] = None) -> Self:
-        """Apply softmax along the given dimension."""
-        if dim is None and "pos_k" in self._shape:
-            dim = "pos_k"
-        dim_index = self._dim_name_to_index(dim)
-        return self.edited(self.value.softmax(dim=dim_index))
-
-    def norm(self, dim: Optional[str] = None, keepdim: bool = False) -> Self:
-        """Compute the norm along the given dimension."""
-        dim_index = self._dim_name_to_index(dim)
-        new_shape = self._get_shape_without(dim, keepdim)
-        value = torch.linalg.vector_norm(self.value, dim=dim_index, keepdim=keepdim)
-        return self.edited(value, new_shape)
-
-    def normalise(self, dim: Optional[str] = None) -> Self:
-        """Normalise the tensor along the given dimension."""
-        dim_index = self._dim_name_to_index(dim)
-        return self.edited(self.value / self.value.norm(dim=dim_index, keepdim=True))
-
-    def remove_diag(self) -> Self:
-        """Set the diagonal of the last two dimensions to 0."""
-        assert len(self._shape) >= 2, f"Cannot remove diag of {self}, not enough dimensions"
-        assert self.value.shape[-1] == self.value.shape[
-            -2], f"Cannot remove diag of {self}, last two dimensions are not equal"
-        return self.edited(self.value - self.value.diag().diag())
-
-    def flatten(self, *dims: str) -> Self:
-        """Flatten the two dimensions into one"""
-        for dim in dims:
-            assert dim in self._shape, f"Dimension {dim} not in {self._shape}"
-        assert len(set(dims)) == len(dims), f"Repeated dimensions in {dims}"
-
-        if not dims:
-            dims = self._shape
-        elif len(dims) == 1:
-            raise ValueError(f"Cannot flatten only one dimension: {dims}")
-
-        # Put the dimensions at the end
-        out = self.by(*dims, last=True)
-
-        new_name = f"flat_{'_'.join(dims)}"
-        new_shape = out._shape[:-len(dims)] + [new_name]
-        value = self.value.flatten(len(new_shape) - 1)
-
-        return out.edited(value, new_shape)
-
-    def sum(self, dim: Optional[str] = None, keepdim: bool = False) -> Self:
-        """Sum along the given dimension."""
-        dim_index = self._dim_name_to_index(dim)
-        new_shape = self._get_shape_without(dim, keepdim)
-        return self.edited(self.value.sum(dim=dim_index, keepdim=keepdim), new_shape)
-
-    def apply(self, func: Callable[[Tensor], Tensor]) -> Self:
-        """Apply a function to the tensor."""
-        out = func(self.value)
-        assert out.shape == self.value.shape, f"Function changed the shape of {self} to {out.shape}. Shape must be kept."
-        return self.edited(out)
-
-    def __call__(self, func: Callable[[Tensor], Tensor]) -> Self:
-        """Apply a function to the tensor."""
-        return self.apply(func)
-
-    # Functions of arriy 2
-
-    def _mul(self,
-             other: Tensor,
-             other_shape: List[str],
-             bias: Optional[Tensor] = None,
-             prefered_dim: Optional[str] = None) -> Self:
-        """Multiply the tensor with another one, automatically finding the dimension to multiply.
-
-        Args:
-            other (Tensor): The other tensor to multiply with.
-            other_shape (List[str]): The shape of the other tensor.
-            bias (Optional[Tensor], optional): Optianally add a bias. Bias is assumed to have the same shape as other, except for the dim that is multiplied.
-            prefered_dim (Optional[str], optional): If given, use this dimension to multiply (according to Circuit._prefered_dim).
-
-        Returns:
-            Self: self * other + bias
-        """
-
-        # Check that the other shape is coherent
-        assert len(other.shape) == len(
-            other_shape), f"Shape {other_shape} does not match value shape {other.shape}"
-        # Check that no dim is repeated in each tensor
-        assert len(set(self._shape)) == len(self._shape), f"Repeated dimensions in {self._shape}"
-        assert len(set(other_shape)) == len(other_shape), f"Repeated dimensions in {other_shape}"
-
-        if not self._shape:  # 0D tensor
-            return self.edited(self.value * other, other_shape)
-
-        # Find the dimension on which to multiply
-        possible_multiplied_dims = set(self._shape) & set(other_shape)
-        dim = self._prefered_dim(possible_multiplied_dims, prefered_dim)
-
-        pattern_1 = " ".join(self._shape)
-        pattern_2 = " ".join(other_shape)
-
-        shape = [d for d in self._shape if d != dim
-                 ] + [d for d in other_shape if d not in possible_multiplied_dims]
-        pattern_target = ' '.join(shape)
-
-        value = einops.einsum(
-            self.value,
-            other,
-            f"{pattern_1}, {pattern_2} -> {pattern_target}",
-        )
-
-        if bias is not None:
-            bias_shape = [d for d in other_shape if d != dim]
-            assert len(bias.shape) == len(
-                bias_shape), f"Shape {bias_shape} does not match value shape {bias.shape}"
-            target_shape = [d if d in bias_shape else "1" for d in shape]  # broadcast the bias
-            bias = einops.rearrange(bias, f"{' '.join(bias_shape)} -> {' '.join(target_shape)}")
-            value += bias
-
-        return self.edited(value, shape)
 
     def qk(self,
            layer: Optional[int],
@@ -475,104 +606,13 @@ class Kuit:
 
         return out
 
-    def add(self, other: Self) -> Self:
-        """Add the value of the other circuit to this one.
+    # Other functions
 
-        One of the shape must be a subset of the other. The addition broadcast on the other dims.
-        See also: Circuit.new_dim to extend a shape.
-        """
-        assert self.model is other.model, "Both circuits must have the same model"
-
-        # We keep the one with the largest number of dimensions
-        if len(self._shape) < len(other._shape):
-            return other.add(self)
-
-        assert set(other.shape) <= set(self.shape), f"Cannot add {other.shape} to {self.shape}"
-
-        other_new_shape = [d if d in other._shape else "1" for d in self._shape]
-        other_value = einops.rearrange(other.value,
-                                       f"{' '.join(other._shape)} -> {' '.join(other_new_shape)}")
-
-        return self.edited(self.value + other_value)
-
-    def histogram(self, **kwargs) -> Self:
-        return self.plot('histogram', **kwargs)
-
-    def line(self, **kwargs) -> Self:
-        return self.plot('line', **kwargs)
-
-    def plot(self, plot_type: Literal['imshow', 'line', 'histogram'] = 'imshow', **kwargs) -> Self:
-        """Plot the tensor!
-
-        TODO: Document how the plot is made.
-        """
-
-        dim_plot = 2 if plot_type == 'imshow' else 1
-
-        if len(self._shape) > dim_plot:
-            facet_dim = (-dim_plot - 1) % len(self._shape)
-            facet_name = self._shape[facet_dim]
-            nb_plots = self.value.shape[facet_dim]
-            kwargs.setdefault('facet_col', facet_dim)
-            if 'facet_col_wrap' in kwargs:
-                wrap = kwargs['facet_col_wrap']
-            elif nb_plots < 4:
-                wrap = nb_plots
-            elif nb_plots == 4:
-                wrap = 2
-            else:
-                wrap = 3
-            kwargs.setdefault('facet_col_wrap', wrap)
-            kwargs.setdefault('height', 500 * (nb_plots // wrap))
-
-            if facet_name.startswith('head'):
-                kwargs.setdefault('facet_labels', [f"Head {i}" for i in range(nb_plots)])
-            elif facet_name.startswith('layer'):
-                kwargs.setdefault('facet_labels', [f"Layer {i}" for i in range(nb_plots)])
-            else:
-                print(f"Warning: Don't know how to label {facet_name}")
-
-        if len(self._shape) == dim_plot + 2:
-            kwargs.setdefault('animation_frame', 0)
-        elif len(self._shape) > dim_plot + 2:
-            raise ValueError(f"Cannot plot {self}: Too many dimensions.")
-
-        kwargs.setdefault('title', str(self))
-
-        if plot_type == 'histogram':
-            px.histogram(self.value, **kwargs).show()
-            return self
-
-        x_name = self._shape[-1]
-        kwargs.setdefault('xaxis_title', x_name)
-        if x_name.startswith('vocab'):
-            if self.shape[x_name] == len(TOKEN_NAMES):
-                kwargs.setdefault('x', TOKEN_NAMES)
-            elif self.shape[x_name] == len(CELL_TOKEN_NAMES):
-                kwargs.setdefault('x', CELL_TOKEN_NAMES)
-
-        if plot_type == 'imshow':
-            y_name = self._shape[-2]
-            kwargs.setdefault('yaxis_title', y_name)
-            if y_name.startswith('vocab'):
-                if self.shape[y_name] == len(TOKEN_NAMES):
-                    kwargs.setdefault('y', TOKEN_NAMES)
-                elif self.shape[y_name] == len(CELL_TOKEN_NAMES):
-                    kwargs.setdefault('y', CELL_TOKEN_NAMES)
-
-            try:
-                imshow(self.value, **kwargs)
-            except Exception as e:
-                print("Error while plotting", self)
-                raise
-
-        elif plot_type == 'line':
-            # kwargs.setdefault('xaxis', x_name)
-            kwargs.setdefault('xaxis_title', x_name)
-            line(self.value, **kwargs)
-        else:
-            raise ValueError(f"Unknown type: {plot_type}")
-        return self
+    def softmax(self, dim: Optional[str] = None) -> Self:
+        """Apply softmax along the given dimension. If dim is None, tries to use the "pos_k" dimension."""
+        if dim is None and "pos_k" in self._shape:
+            dim = "pos_k"
+        return super().softmax(dim)
 
 
 if __name__ == "__main__":
