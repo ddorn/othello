@@ -268,8 +268,8 @@ def move_sequence_to_state(
 
 # %%
 def state_stack_to_one_hot(
-    state_stack: Float[Tensor, "games moves rows=8 cols=8"]
-) -> Bool[Tensor, "games moves rows=8 cols=8 options=3"]:
+    state_stack: Float[Tensor, "..."]
+) -> Bool[Tensor, "... options=3"]:
     """
     Creates a tensor of shape (games, moves, rows=8, cols=8, options=3), where the [g, m, r, c, :]-th entry
     is a one-hot encoded vector for the state of game g at move m, at row r and column c. In other words, this
@@ -279,10 +279,7 @@ def state_stack_to_one_hot(
     this will return a tensor where (1, 0, 0) is empty, (0, 1, 0) is white, and (0, 0, 1) is black.
     """
     one_hot = t.zeros(
-        state_stack.shape[0],  # num games
-        state_stack.shape[1],  # num moves
-        8,
-        8,
+        *state_stack.shape,
         3,  # the options: empty, white, or black
         device=state_stack.device,
         dtype=t.bool,
