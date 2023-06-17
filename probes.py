@@ -246,13 +246,6 @@ class LitLinearProbe(LightningModule):
 
         # state_stack_one_hot = tensor of one-hot encoded states for each game
         # We'll multiply this by our probe's estimated log probs along the `options` dimension, to get probe's estimated log probs for the correct option
-        assert isinstance(
-            state_stack_one_hot,
-            Bool[
-                Tensor,
-                f"batch game_len={game_len} rows=8 cols=8 options=3",
-            ],
-        ), state_stack_one_hot.shape
 
         act_name = utils.get_act_name("resid_post", self.args.layer)
 
@@ -372,13 +365,14 @@ class LitLinearProbe(LightningModule):
 class ProbeConfig:
     cell: str
     """Which cell to predict. Eg. 'A2'."""
-    trained_on_move: int
+    trained_on: int
     """The probe will be applied only on the residual stream at this move."""
     layer: int
     """The layer on which the probe is trained."""
     probe_point: str = "resid_post"
     """The activation with this name are the input of the probe."""
     device: str = "cuda"
+    trained_on_type: Literal["move", "token"] = "move"
 
     has_blank: bool = True
 
@@ -399,7 +393,7 @@ class ProbeConfig:
 
     def __post_init__(self) -> None:
         assert self.cell in FULL_BOARD_LABELS
-        assert 0 <= self.trained_on_move < 59
+        assert 0 <= self.trained_on < 59
 
     @property
     def row(self) -> int:
@@ -415,7 +409,7 @@ class ProbeConfig:
 
     @property
     def name(self) -> str:
-        return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.trained_on_move}"
+        return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.trained_on}"
 
     @property
     def act_name(self) -> str:
@@ -441,9 +435,7 @@ class Probe(t.nn.Module):
         super().__init__()
         self._model = (model,)
         self.probe = t.nn.Parameter(
-            t.randn(
-                config.options, config.trained_on_move + 1, model.cfg.d_model, device=config.device
-            )
+            t.randn(config.options, config.trained_on + 1, model.cfg.d_model, device=config.device)
             / np.sqrt(model.cfg.d_model)
         )
         self.config = config
@@ -464,27 +456,34 @@ class Probe(t.nn.Module):
         # Get the residual stream of the model on the right layer
         with t.no_grad():
             _, cache = self.model.run_with_cache(
-                tokens[:, : self.config.trained_on_move + 1].to(self.config.device),
+                tokens[:, : self.config.trained_on + 1].to(self.config.device),
                 names_filter=lambda n: n == self.config.act_name,
                 stop_at_layer=self.config.layer + 1,
             )
 
+        return self.select_activations(tokens, cache[self.config.act_name])
+
+    def select_activations(
+        self, tokens: Int[Tensor, "game move"], cache: Float[Tensor, "game move dmodel"]
+    ) -> Float[Tensor, "game dmodel"]:
         # Get the residual stream at the move where the probe is trained
-        return cache[self.config.act_name][:, self.config.trained_on_move, :]
+        return cache[self.config.act_name][:, self.config.trained_on, :]
 
     def forward(
         self,
         tokens: Tokens,
         tokens_type: TokensType = "tokens",
     ) -> Float[Tensor, "game first_moves option"]:
-        assert tokens_type in ["tokens", "activations"]
-        assert tokens.shape[1] >= self.config.trained_on_move + 1
-
         # Compute the activations
         if tokens_type == "tokens":
             residual_stream = self.get_activations(tokens)
-        else:
+        elif tokens_type == "activations":
             residual_stream = tokens
+        else:
+            raise ValueError(f"Unknown tokens_type: {tokens_type}")
+
+        # move is just the number of features / variables we want to predict
+        # and each has 3 options
 
         # Apply the probe
         return einops.einsum(
@@ -501,8 +500,26 @@ class Probe(t.nn.Module):
         per_move: bool = False,
         return_accuracy: bool = False,
     ) -> Tensor:
+        """
+        Compute the loss of the probe on a batch of games.
+
+        Args:
+            tokens: Either the tokens to feed into the model or the pre-recorded activations.
+            cell_state: The correct predictions of the probe. This corresponds to output.argmax(dim=-1) for a perfect probe.
+            tokens_type: if "tokens", tokens is the tokens to feed into the model. If "activations", tokens is the activations of the model.
+            per_move: If True, return the loss per move. Otherwise, return the average loss.
+            return_accuracy: Whether to also compute the accuracy of the probe. Return a tensor [loss, accuracy] if True.
+
+        Returns:
+            A tensor whose size depends on `per_move` and `return_accuracy`.
+            - If `per_move` and `return_accuracy`, the tensor is of shape [2, moves].
+            - If `per_move` and not `return_accuracy`, the tensor is of shape [moves].
+            - If not `per_move` and `return_accuracy`, the tensor is of shape [2].
+            - If not `per_move` and not `return_accuracy`, is a scalar.
+        """
+
         # We don't need states further than the trained_on_move
-        correct_options = cell_state[:, : self.config.trained_on_move + 1].to(
+        correct_options = cell_state[:, : self.config.trained_on + 1].to(
             device=self.config.device, dtype=t.long
         )
 
@@ -586,7 +603,7 @@ class Probe(t.nn.Module):
                 loss = self.loss(*batch, tokens_type=train_type)
                 # We correct for the mean on the move, so that the learning rate does
                 # not depend on the number of moves.
-                loss = loss * t.tensor(self.config.trained_on_move + 1)
+                loss = loss * t.tensor(self.config.trained_on + 1)
                 loss.backward()
                 optim.step()
 
@@ -611,7 +628,7 @@ class Probe(t.nn.Module):
         val_type: TokensType = "tokens",
         use_wandb: Optional[bool] = None,
     ) -> Float[Tensor, "metric=2 move"]:
-        metric = t.zeros(2, self.config.trained_on_move + 1, device=self.config.device)
+        metric = t.zeros(2, self.config.trained_on + 1, device=self.config.device)
         total_games = 0
         for batch in val_loader:
             batch_metric = self.loss(
@@ -643,10 +660,10 @@ class Probe(t.nn.Module):
             tokens.shape[0] >= max_games
         ), f"Only {tokens.shape[0]} games available but {max_games} requested"
         assert (
-            tokens.shape[1] >= self.config.trained_on_move + 1
-        ), f"Only {tokens.shape[1]} moves available but {self.config.trained_on_move + 1} requested"
+            tokens.shape[1] >= self.config.trained_on + 1
+        ), f"Only {tokens.shape[1]} moves available but {self.config.trained_on + 1} requested"
 
-        tokens = tokens[:max_games, : self.config.trained_on_move + 1]
+        tokens = tokens[:max_games, : self.config.trained_on + 1]
         states = move_sequence_to_state(tokens_to_board(tokens), mode="mine-their")
         states = states[:max_games, :, self.config.row, self.config.col]
         states = state_stack_to_correct_option(states)
@@ -719,7 +736,7 @@ class StatsProbe(Probe):
         logits = t.log(
             stats[
                 1 - self.config.has_blank :,
-                : self.config.trained_on_move + 1,
+                : self.config.trained_on + 1,
                 self.config.row,
                 self.config.col,
             ]
