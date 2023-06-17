@@ -458,6 +458,7 @@ class Probe(t.nn.Module):
             print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
             return
         t.save(self.probe, path)
+        print(f"Probe saved to {path.resolve()}")
 
     def get_activations(self, tokens: Int[Tensor, "game move"]) -> Float[Tensor, "game dmodel"]:
         # Get the residual stream of the model on the right layer
@@ -687,7 +688,7 @@ class Probe(t.nn.Module):
         )
 
 
-class HeuristicProbe(Probe):
+class ConstantProbe(Probe):
     def __init__(self, logits: List[float], model: HookedTransformer, config: ProbeConfig) -> None:
         super().__init__(model, config)
         self.logits = logits
@@ -700,3 +701,36 @@ class HeuristicProbe(Probe):
         assert tokens_type == "tokens", "Heuristic probe only works with tokens"
         l = t.tensor(self.logits, device=self.config.device)
         return l[None, None].expand(*tokens.shape, -1)
+
+
+class StatsProbe(Probe):
+    logits: Float[Tensor, "move option"]
+
+    def __init__(
+        self,
+        stats: Float[Tensor, "stat=3 move=60 row=8 col=8"],
+        model: HookedTransformer,
+        config: ProbeConfig,
+    ) -> None:
+        super().__init__(model, config)
+        assert stats.shape == (3, 60, 8, 8)
+        # We go from the probability of each cell to logits that correspond to the
+        # probabilities. Which are just the log of the probabilities.
+        logits = t.log(
+            stats[
+                1 - self.config.has_blank :,
+                : self.config.trained_on_move + 1,
+                self.config.row,
+                self.config.col,
+            ]
+        )
+        self.logits = einops.rearrange(logits, "stat move -> move stat")
+
+    def forward(
+        self,
+        tokens: Int[Tensor, "game move"],
+        tokens_type: TokensType = "tokens",
+    ) -> Float[Tensor, "game first_moves option"]:
+        assert tokens_type == "tokens", "Heuristic probe only works with tokens"
+
+        return self.logits[None].expand(tokens.shape[0], -1, -1).to(self.config.device)
