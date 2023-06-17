@@ -136,7 +136,7 @@ class ProbeTrainingArgs:
     """Whether to predict black/white cells or mine/theirs"""
 
     correct_for_dataset_bias: Bool = False
-    """Wether to correct for options that are present more often, per move and per game"""
+    """Whether to correct for options that are present more often, per move and per game"""
 
     # Which layer, and which positions in a game sequence to probe
     layer: int = 6
@@ -159,7 +159,7 @@ class ProbeTrainingArgs:
     betas: Tuple[float, float] = (0.9, 0.99)
     wd: float = 0.01
 
-    # Othognal regularization (to an other probe)
+    # Orthogonal regularization (to another probe)
     penalty_weight: float = 1_000.0
 
     # Misc.
@@ -189,8 +189,8 @@ class ProbeTrainingArgs:
             device=model.cfg.device,
         ) / np.sqrt(model.cfg.d_model)
         # We want to pass this tensor to the optimizer, so it needs to be a leaf,
-        # and not be a computation of other tensors (here divison by sqrt(d_model))
-        # Thus, we can't use the `requires_grad` argument of `t.randn`.
+        # and not be a computation of other tensors (here division by sqrt(d_model))
+        # Thus, we can't use the `requires_grad` argument in the line above.
         linear_probe.requires_grad = True
         return linear_probe
 
@@ -263,8 +263,8 @@ class LitLinearProbe(LightningModule):
             resid_post,
             "d_model row col option, batch move d_model -> batch move row col option",
         )
-        probe_logprobs = probe_logits.log_softmax(dim=-1)
-        loss = probe_logprobs * state_stack_one_hot.float()
+        probe_log_probs = probe_logits.log_softmax(dim=-1)
+        loss = probe_log_probs * state_stack_one_hot.float()
         if self.args.correct_for_dataset_bias:
             loss = loss / (self.dataset_stats[focus_moves] + 1e-5)
         # Multiply to correct for the mean over options
@@ -361,143 +361,203 @@ class LitLinearProbe(LightningModule):
         )
 
 
-@dataclass
-class ProbeConfig:
-    cell: str
-    """Which cell to predict. Eg. 'A2'."""
-    trained_on: int
-    """The probe will be applied only on the residual stream at this move."""
-    layer: int
-    """The layer on which the probe is trained."""
-    probe_point: str = "resid_post"
-    """The activation with this name are the input of the probe."""
-    device: str = "cuda"
-    trained_on_type: Literal["move", "token"] = "move"
-
-    has_blank: bool = True
-
-    # Training
-    use_wandb: bool = False
-    seed: int = 42
-
-    epochs: int = 4
-    lr: float = 0.01
-    wd: float = 0.0
-    betas: Tuple[float, float] = (0.9, 0.99)
-    val_loss_early_stop: float = 0.0
-
-    batch_size: int = 500
-    num_train_games: int = 10_000
-    num_valid_games: int = 200
-    validate_every: int = 10
-
-    def __post_init__(self) -> None:
-        assert self.cell in FULL_BOARD_LABELS
-        assert 0 <= self.trained_on < 59
-
-    @property
-    def row(self) -> int:
-        return ord(self.cell[0].upper()) - ord("A")
-
-    @property
-    def col(self) -> int:
-        return int(self.cell[1])
-
-    @property
-    def options(self) -> int:
-        return 3 if self.has_blank else 2
-
-    @property
-    def name(self) -> str:
-        return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.trained_on}"
-
-    @property
-    def act_name(self) -> str:
-        return utils.get_act_name(self.probe_point, self.layer)
-
-    def load(self, model: HookedTransformer) -> "Probe":
-        weight = t.load(PROBE_DIR / f"{self.name}.pt")
-        probe = Probe(model, self)
-        probe.probe = weight
-        return probe
-
-
 TokensType = Literal["tokens", "activations"]
 Tokens = Union[Int[Tensor, "game move"], Float[Tensor, "game dmodel"]]
 
 
 class Probe(t.nn.Module):
-    """A probe that predicts the state of the board"""
+    """
+    A linear probe from the activation of a model.
 
-    probe: Float[Tensor, "options move dmodel"]
+    This class is `num_probes` linear probes, each predicting `options` classes.
 
-    def __init__(self, model: HookedTransformer, config: ProbeConfig) -> None:
+    To configure for a specific task (all optional):
+    - create a Config subclass to add more options.
+    - over
+    """
+
+    probe: Float[Tensor, "probes options dmodel"]
+
+    @dataclass
+    class Config:
+        layer: int
+        """The layer on which the probe is trained."""
+        probe_point: str = "resid_post"
+        """The activation with this name are the input of the probe."""
+
+        num_probes: int = 1
+        """How many probes to train."""
+        options: int = 2
+        """How many options each probe predicts."""
+
+        device: str = "cuda"
+
+        # Training
+        use_wandb: bool = False
+        seed: int = 42
+
+        epochs: int = 4
+        lr: float = 0.01
+        wd: float = 0.0
+        betas: Tuple[float, float] = (0.9, 0.99)
+
+        batch_size: int = 500
+        num_train_games: int = 10_000
+        num_val_games: int = 200
+        validate_every: int = 10
+
+        @property
+        def act_name(self) -> str:
+            return utils.get_act_name(self.probe_point, self.layer)
+
+        def name(self) -> str:
+            return f"probe_{self.layer}_{self.act_name}_{self.num_probes}x{self.options}"
+
+        def load(self, model: HookedTransformer) -> "Probe":
+            weight = t.load(PROBE_DIR / f"{self.name()}.pt")
+            probe = Probe(model, self)
+            probe.probe = weight
+            return probe
+
+    def __init__(self, model: HookedTransformer, config: Config) -> None:
         super().__init__()
+        self.config = config
+        # This is a hack to avoid having the model registered as a submodule.
         self._model = (model,)
         self.probe = t.nn.Parameter(
-            t.randn(config.options, config.trained_on + 1, model.cfg.d_model, device=config.device)
+            t.randn(config.num_probes, config.options, model.cfg.d_model, device=config.device)
             / np.sqrt(model.cfg.d_model)
         )
-        self.config = config
 
     @property
     def model(self) -> HookedTransformer:
         return self._model[0]
 
-    def save(self, force: bool = False) -> None:
-        path = PROBE_DIR / f"{self.config.name}.pt"
-        if path.exists() and not force:
-            print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
-            return
-        t.save(self.probe, path)
-        print(f"Probe saved to {path.resolve()}")
+    # Step 0: Convert tokens to correct answers
 
-    def get_activations(self, tokens: Int[Tensor, "game move"]) -> Float[Tensor, "game dmodel"]:
+    def get_correct_answers(
+        self, tokens: Int[Tensor, "batch token"]
+    ) -> Int[Tensor, "batch probe *activation"]:
+        raise NotImplementedError("Override this method to compute the correct answers.")
+
+    def dataloader(
+        self, tokens: Int[Tensor, "game move"], for_validation: bool = False
+    ) -> DataLoader:
+        if for_validation:
+            max_games = self.config.num_val_games
+        else:
+            max_games = self.config.num_train_games
+
+        return DataLoader(
+            TensorDataset(tokens[:max_games], self.get_correct_answers(tokens[:max_games])),
+            batch_size=self.config.batch_size,
+            shuffle=not for_validation,
+        )
+
+    # Step 1: Convert tokens to activations
+
+    def get_activations(
+        self, tokens: Int[Tensor, "batch token"]
+    ) -> Float[Tensor, "batch *activation dmodel"]:
+        """Transform a batch of tokens into activations to feed the probes."""
+
         # Get the residual stream of the model on the right layer
         with t.no_grad():
+            tokens = tokens.to(self.config.device)
             _, cache = self.model.run_with_cache(
-                tokens[:, : self.config.trained_on + 1].to(self.config.device),
+                tokens,
                 names_filter=lambda n: n == self.config.act_name,
+                # TODO: Allow for a more generic filter
                 stop_at_layer=self.config.layer + 1,
             )
 
+        # Select the activations we want
         return self.select_activations(tokens, cache[self.config.act_name])
 
     def select_activations(
-        self, tokens: Int[Tensor, "game move"], cache: Float[Tensor, "game move dmodel"]
-    ) -> Float[Tensor, "game dmodel"]:
-        # Get the residual stream at the move where the probe is trained
-        return cache[self.config.act_name][:, self.config.trained_on, :]
+        self, tokens: Int[Tensor, "batch token"], cache: Float[Tensor, "batch *activation dmodel"]
+    ) -> Float[Tensor, "batch *activation dmodel"]:
+        return cache  # XXX
+
+    # Step 1 bonus: Pre-compute activations
+
+    def dataloader_activations(
+        self,
+        tokens: Int[Tensor, "game move"],
+        batch_size: int = 500,
+        for_validation: bool = False,
+    ) -> DataLoader:
+        if for_validation:
+            max_games = self.config.num_val_games
+        else:
+            max_games = self.config.num_train_games
+
+        # Convert the tokens into a dataloader to iterate over in batches
+        tokens_loader = DataLoader(TensorDataset(tokens[:max_games]), batch_size=batch_size)
+
+        # Big tensor to store the activations on cpu
+        activations = t.empty(max_games, self.model.cfg.d_model, device="cpu")
+        game = 0
+        for tokens in tqdm(tokens_loader, desc="Computing activations"):
+            activations[game : game + len(tokens)] = self.get_activations(tokens).cpu()
+            game += len(tokens)
+
+        return DataLoader(
+            TensorDataset(activations, self.get_correct_answers(tokens[:max_games])),
+            batch_size=self.config.batch_size,
+            shuffle=not for_validation,
+        )
+
+    # Step 2: Apply the probe on the activations
 
     def forward(
         self,
-        tokens: Tokens,
-        tokens_type: TokensType = "tokens",
-    ) -> Float[Tensor, "game first_moves option"]:
-        # Compute the activations
-        if tokens_type == "tokens":
-            residual_stream = self.get_activations(tokens)
-        elif tokens_type == "activations":
-            residual_stream = tokens
-        else:
-            raise ValueError(f"Unknown tokens_type: {tokens_type}")
+        tokens: Union[Int[Tensor, "batch token"], Float[Tensor, "batch *activation dmodel"]],
+    ) -> Float[Tensor, "batch probe *activation option"]:
+        """
+        Compute the predictions (logits) of the probe on the given tokens/activations.
 
-        # move is just the number of features / variables we want to predict
-        # and each has 3 options
+        If tokens is a tensor of int64, it is passed through the model first to get the activations.
+        Otherwise, if tokens is a tensor of float32, it is assumed to be activations and is passed directly to the probe.
+
+        Args:
+            tokens: A batch of tokens or activations.
+
+        Returns:
+            A tensor of shape [batch, probes, options] containing the logits of the probe.
+        """
+
+        # Compute the activations
+        if tokens.dtype == t.float32:
+            residual_stream = tokens
+        elif tokens.dtype == t.int64:
+            residual_stream = self.get_activations(tokens)
+        else:
+            raise ValueError(
+                f"Expected tokens to be a tensor of float32 or int64 but got: {tokens.dtype}"
+            )
 
         # Apply the probe
+        return self.apply_probe(residual_stream.to(self.config.device))
+
+    def activation_forward(
+        self, activations: Float[Tensor, "*activation dmodel"]
+    ) -> Float[Tensor, "batch probes *activation option"]:
+        # By default, we multiply along the last dimension of both, and concatenate the other dims.
+
         return einops.einsum(
             self.probe,
-            residual_stream.to(self.config.device),
-            "option move dmodel, game dmodel -> game move option",
+            activations,
+            "probe option dmodel, batch ... dmodel -> batch probe ... option",
         )
+
+    # Step 3: Compute the loss
 
     def loss(
         self,
-        tokens: Tokens,
-        cell_state: Optional[Int[Tensor, "game move"]],
-        tokens_type: TokensType = "tokens",
-        per_move: bool = False,
+        tokens: Union[Int[Tensor, "batch token"], Float[Tensor, "batch *activation dmodel"]],
+        correct: Int[Tensor, "batch probe *activation"],
+        per_probe: bool = False,
         return_accuracy: bool = False,
     ) -> Tensor:
         """
@@ -505,9 +565,8 @@ class Probe(t.nn.Module):
 
         Args:
             tokens: Either the tokens to feed into the model or the pre-recorded activations.
-            cell_state: The correct predictions of the probe. This corresponds to output.argmax(dim=-1) for a perfect probe.
-            tokens_type: if "tokens", tokens is the tokens to feed into the model. If "activations", tokens is the activations of the model.
-            per_move: If True, return the loss per move. Otherwise, return the average loss.
+            correct: TODO: Document loss()
+            per_probe: If True, return the loss per move. Otherwise, return the average loss.
             return_accuracy: Whether to also compute the accuracy of the probe. Return a tensor [loss, accuracy] if True.
 
         Returns:
@@ -518,74 +577,57 @@ class Probe(t.nn.Module):
             - If not `per_move` and not `return_accuracy`, is a scalar.
         """
 
-        # We don't need states further than the trained_on_move
-        correct_options = cell_state[:, : self.config.trained_on + 1].to(
-            device=self.config.device, dtype=t.long
-        )
-
         # Get the predictions of the probe
-        logits = self(tokens, tokens_type=tokens_type)
+        logits = self(tokens)
+        logits: Int[Tensor, "batch probe *activation option"]
 
         # Ensure that we have 3 predictions
-        if not self.config.has_blank:
-            # Add a fake blank option, with logits of -1000
-            new_shape = logits.shape[:-1] + (3,)
-            l = t.full(new_shape, -100, device=logits.device, dtype=logits.dtype)
-            l[..., 1:] = logits
-            logits = l
-        logits: Int[Tensor, "game move option=3"]
+        # if not self.config.has_blank:
+        #     # Add a fake blank option, with logits of -1000
+        #     new_shape = logits.shape[:-1] + (3,)
+        #     l = t.full(new_shape, -100, device=logits.device, dtype=logits.dtype)
+        #     l[..., 1:] = logits
+        #     logits = l
+
+        # Ensure the predictions are on the right device and dtype
+        correct = correct.to(device=self.config.device, dtype=t.long)
 
         # Compute the loss
         loss = t.nn.functional.cross_entropy(
-            logits.flatten(0, 1),
-            correct_options.flatten(),
-            reduction="none" if per_move else "mean",
+            logits.flatten(0, -2),  # all but the `option` dimension
+            correct.flatten(),
+            reduction="none" if per_probe else "mean",
         )
-        if per_move:
-            loss = loss.reshape(correct_options.shape).mean(0)  # mean on game, keep move
+
+        if per_probe:
+            # mean over all but `probe` dimension
+            dims = [d for d in range(loss.ndim) if d != 1]
+            loss = loss.reshape(correct.shape).mean(dims)
 
         if not return_accuracy:
             return loss
 
+        # Compute the accuracy
         # noinspection PyUnresolvedReferences
-        accuracy = (logits.argmax(dim=-1) == correct_options).float()
-        if per_move:
-            accuracy = accuracy.mean(0)  # mean on game, keep move
+        accuracy = (logits.argmax(dim=-1) == correct).float()
+        if per_probe:
+            # noinspection PyUnboundLocalVariable
+            accuracy = accuracy.mean(dims)  # mean on game, keep move
         else:
             accuracy = accuracy.mean()  # mean on game and move
 
         return t.stack([loss, accuracy])
 
-    def _parse_data(
-        self,
-        data: Union[Int[Tensor, "game move"], DataLoader],
-        data_type: TokensType,
-        shuffle: bool = True,
-    ) -> DataLoader:
-        assert data_type in ["tokens", "activations"]
-        if isinstance(data, Tensor):
-            assert data_type == "tokens", "If train_tokens is a tensor, train_type must be 'tokens'"
-            return self.dataloader(data, self.config.num_train_games, shuffle=shuffle)
-        else:
-            assert isinstance(
-                data, DataLoader
-            ), f"train_data must be a tensor or a dataloader, got: {type(data)}"
-            return data
+    # Step 4: Train the probe
 
     def train_loop(
         self,
-        train_data: Union[Int[Tensor, "game move"], DataLoader],
-        val_data: Union[Int[Tensor, "game move"], DataLoader],
-        train_type: TokensType = "tokens",
-        val_type: TokensType = "tokens",
+        train_data: DataLoader,
+        val_data: DataLoader,
     ) -> None:
         rprint(self.config)
         make_deterministic(self.config.seed)
         t.set_grad_enabled(True)
-
-        # Get the dataloaders
-        train_loader = self._parse_data(train_data, train_type)
-        val_loader = self._parse_data(val_data, val_type)
 
         # Optimizer
         optim = t.optim.AdamW(
@@ -598,56 +640,52 @@ class Probe(t.nn.Module):
         step = 0
         nb_games = 0
         for epoch in trange(self.config.epochs, desc="Epoch"):
-            for batch in train_loader:
+            for batch in train_data:
                 optim.zero_grad()
-                loss = self.loss(*batch, tokens_type=train_type)
-                # We correct for the mean on the move, so that the learning rate does
-                # not depend on the number of moves.
-                loss = loss * t.tensor(self.config.trained_on + 1)
-                loss.backward()
+                loss = self.loss(*batch)
+                # Avoid having the gradients scale with number of probes
+                (loss * t.tensor(self.config.num_probes)).backward()
                 optim.step()
 
                 if self.config.use_wandb:
                     wandb.log({"loss": loss.item(), "games": nb_games, "epoch": epoch})
 
                 if step % self.config.validate_every == 0:
-                    val_loss = self.validate(val_loader, val_type)
-                    if val_loss.max() < self.config.val_loss_early_stop:
-                        return
+                    self.validate(val_data)
 
                 step += 1
                 nb_games += len(batch[0])
 
-        val_loss = self.validate(val_loader, val_type)
+        val_loss = self.validate(val_data)
         print(f"End validation (loss, accuracy): {val_loss.mean(1)}")
+
+    # Step 5: Evaluate the probe
 
     @t.inference_mode()
     def validate(
         self,
         val_loader: DataLoader,
-        val_type: TokensType = "tokens",
         use_wandb: Optional[bool] = None,
-    ) -> Float[Tensor, "metric=2 move"]:
-        metric = t.zeros(2, self.config.trained_on + 1, device=self.config.device)
+    ) -> Float[Tensor, "metric=2 probe"]:
+        # Compute the average loss and accuracy, taking into account that batches might have different sizes
         total_games = 0
+        metric = t.zeros(2, self.config.num_probes, device=self.config.device)
         for batch in val_loader:
-            batch_metric = self.loss(
-                *batch, tokens_type=val_type, per_move=True, return_accuracy=True
-            )
-            metric += batch_metric * len(batch)
+            batch_metric = self.loss(*batch, per_probe=True, return_accuracy=True)
+            metric += batch_metric * len(batch[0])
             total_games += len(batch)
         metric /= total_games
 
-        mid_pos = metric.shape[1] // 2
+        # Log the metrics if needed
         if self.config.use_wandb and use_wandb is not False:
             accu = metric[1]
+            mid_pos = len(accu) // 2
             wandb.log(
                 {
-                    "val_acc_move_0": accu[0],
-                    f"val_acc_move_{mid_pos}": accu[mid_pos],
-                    "val_acc_move_second_last": accu[-3],
-                    "val_acc_move_prev": accu[-2],
-                    "val_acc_move_self": accu[-1],
+                    "val_acc_probe_0": accu[0],
+                    f"val_acc_probe_{mid_pos}": accu[mid_pos],
+                    "val_acc_second_last_probe": accu[-2],
+                    "val_acc_last_probe": accu[-1],
                     "val_loss": metric[0].mean(),
                     "val_accuracy": accu.mean(),
                 },
@@ -655,92 +693,105 @@ class Probe(t.nn.Module):
             )
         return metric
 
-    def dataset(self, tokens: Int[Tensor, "game move"], max_games: int) -> TensorDataset:
+    def save(self, force: bool = False) -> None:
+        path = PROBE_DIR / f"{self.config.name}.pt"
+        if path.exists() and not force:
+            print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
+            return
+        t.save(self.probe, path)
+        print(f"Probe saved to {path.resolve()}")
+
+
+class OthelloProbe(Probe):
+    @dataclass
+    class Config(Probe.Config):
+        cell: str = "A1"
+        options: int = 3
+
+        # @property
+        # def row(self) -> int:
+        #     return ord(self.cell[0].upper()) - ord("A")
+        #
+        # @property
+        # def col(self) -> int:
+        #     return int(self.cell[1])
+        #
+        # @property
+        # def options(self) -> int:
+        #     return 3 if self.has_blank else 2
+        #
+        def row_col(self) -> Tuple[int, int]:
+            return ord(self.cell[0].upper()) - ord("A"), int(self.cell[1])
+
+        @property
+        def trained_on(self):
+            return self.num_probes - 1
+
+        def name(self) -> str:
+            return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.num_probes}"
+
+    config: Config
+
+    def get_correct_answers(
+        self, tokens: Int[Tensor, "batch token"]
+    ) -> Int[Tensor, "batch probe *activation"]:
         assert (
-            tokens.shape[0] >= max_games
-        ), f"Only {tokens.shape[0]} games available but {max_games} requested"
-        assert (
-            tokens.shape[1] >= self.config.trained_on + 1
+            tokens.shape[1] > self.config.trained_on
         ), f"Only {tokens.shape[1]} moves available but {self.config.trained_on + 1} requested"
 
-        tokens = tokens[:max_games, : self.config.trained_on + 1]
+        row, col = self.config.row_col()
+
+        tokens = tokens[:, : self.config.trained_on + 1]
         states = move_sequence_to_state(tokens_to_board(tokens), mode="mine-their")
-        states = states[:max_games, :, self.config.row, self.config.col]
+        states = states[:, :, row, col]
         states = state_stack_to_correct_option(states)
         states: Int[Tensor, "game move"]  # Index of the correct cell state
 
-        return TensorDataset(tokens, states)
+        return states
 
-    def dataloader(
-        self, tokens: Int[Tensor, "game move"], max_games: int, shuffle: bool = True
-    ) -> DataLoader:
-        return DataLoader(
-            self.dataset(tokens, max_games),
-            batch_size=self.config.batch_size,
-            shuffle=shuffle,
-        )
-
-    def dataloader_activations(
-        self,
-        tokens: Int[Tensor, "game move"],
-        max_games: int,
-        shuffle: bool = True,
-        batch_size: int = 500,
-    ) -> DataLoader:
-        tokens_data = self.dataset(tokens, max_games)
-        tokens_loader = DataLoader(tokens_data, batch_size=batch_size)
-
-        activations = t.empty(max_games, self.model.cfg.d_model, device="cpu")
-        game = 0
-        for tokens, _ in tqdm(tokens_loader, desc="Computing activations"):
-            act = self.get_activations(tokens)
-            activations[game : game + len(tokens)] = act.cpu()
-            game += len(tokens)
-
-        correct = tokens_data.tensors[1]
-        return DataLoader(
-            TensorDataset(activations, correct),
-            batch_size=self.config.batch_size,
-            shuffle=shuffle,
-        )
+    def select_activations(
+        self, tokens: Int[Tensor, "game move"], cache: Float[Tensor, "game move dmodel"]
+    ) -> Float[Tensor, "game dmodel"]:
+        # Get the residual stream at the move where the probe is trained
+        return cache[:, self.config.trained_on, :]
 
 
-class ConstantProbe(Probe):
-    def __init__(self, logits: List[float], model: HookedTransformer, config: ProbeConfig) -> None:
+class ConstantProbe(OthelloProbe):
+    def __init__(
+        self, logits: List[float], model: HookedTransformer, config: OthelloProbe.Config
+    ) -> None:
         super().__init__(model, config)
         self.logits = logits
 
     def forward(
         self,
         tokens: Tokens,
-        tokens_type: TokensType = "tokens",
     ) -> Float[Tensor, "game first_moves option"]:
-        assert tokens_type == "tokens", "Heuristic probe only works with tokens"
+        assert tokens.dtype == t.int64, f"Expected int64, got {tokens.dtype}"
         l = t.tensor(self.logits, device=self.config.device)
         return l[None, None].expand(*tokens.shape, -1)
 
 
-class StatsProbe(Probe):
+class StatsProbe(OthelloProbe):
     logits: Float[Tensor, "move option"]
 
     def __init__(
         self,
         stats: Float[Tensor, "stat=3 move=60 row=8 col=8"],
         model: HookedTransformer,
-        config: ProbeConfig,
+        config: Probe.Config,
     ) -> None:
         super().__init__(model, config)
-        assert stats.shape == (3, 60, 8, 8)
+        assert stats.shape == (
+            3,
+            60,
+            8,
+            8,
+        ), f"Expected stats to have shape (3, 60, 8, 8), got {stats.shape}"
+        row, col = self.config.row_col()
         # We go from the probability of each cell to logits that correspond to the
         # probabilities. Which are just the log of the probabilities.
-        logits = t.log(
-            stats[
-                1 - self.config.has_blank :,
-                : self.config.trained_on + 1,
-                self.config.row,
-                self.config.col,
-            ]
-        )
+        logits = t.log(stats[:, : self.config.trained_on + 1, row, col])
         self.logits = einops.rearrange(logits, "stat move -> move stat")
 
     def forward(
