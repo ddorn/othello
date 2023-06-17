@@ -444,6 +444,7 @@ class Probe(t.nn.Module):
             t.randn(
                 config.options, config.trained_on_move + 1, model.cfg.d_model, device=config.device
             )
+            / np.sqrt(model.cfg.d_model)
         )
         self.config = config
 
@@ -500,10 +501,7 @@ class Probe(t.nn.Module):
         return_accuracy: bool = False,
     ) -> Tensor:
         # We don't need states further than the trained_on_move
-        cell_state = cell_state[:, : self.config.trained_on_move + 1]
-
-        # Get the correct options
-        correct_option = state_stack_to_correct_option(cell_state).to(
+        correct_options = cell_state[:, : self.config.trained_on_move + 1].to(
             device=self.config.device, dtype=t.long
         )
 
@@ -520,20 +518,19 @@ class Probe(t.nn.Module):
         logits: Int[Tensor, "game move option=3"]
 
         # Compute the loss
-        print(logits.device, correct_option.device, self.config.device)
         loss = t.nn.functional.cross_entropy(
             logits.flatten(0, 1),
-            correct_option.flatten(),
+            correct_options.flatten(),
             reduction="none" if per_move else "mean",
         )
         if per_move:
-            loss = loss.reshape(correct_option.shape).mean(0)  # mean on game, keep move
+            loss = loss.reshape(correct_options.shape).mean(0)  # mean on game, keep move
 
         if not return_accuracy:
             return loss
 
         # noinspection PyUnresolvedReferences
-        accuracy = (logits.argmax(dim=-1) == correct_option).float()
+        accuracy = (logits.argmax(dim=-1) == correct_options).float()
         if per_move:
             accuracy = accuracy.mean(0)  # mean on game, keep move
         else:
@@ -581,8 +578,9 @@ class Probe(t.nn.Module):
         )
 
         step = 0
-        for epoch in range(self.config.epochs):
-            for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
+        nb_games = 0
+        for epoch in trange(self.config.epochs, desc="Epoch"):
+            for batch in train_loader:
                 optim.zero_grad()
                 loss = self.loss(*batch, tokens_type=train_type)
                 # We correct for the mean on the move, so that the learning rate does
@@ -592,7 +590,7 @@ class Probe(t.nn.Module):
                 optim.step()
 
                 if self.config.use_wandb:
-                    wandb.log({"loss": loss.item(), "step": step, "epoch": epoch})
+                    wandb.log({"loss": loss.item(), "games": nb_games, "epoch": epoch})
 
                 if step % self.config.validate_every == 0:
                     val_loss = self.validate(val_loader, val_type)
@@ -600,13 +598,17 @@ class Probe(t.nn.Module):
                         return
 
                 step += 1
+                nb_games += len(batch[0])
 
         val_loss = self.validate(val_loader, val_type)
         print(f"End validation (loss, accuracy): {val_loss.mean(1)}")
 
     @t.inference_mode()
     def validate(
-        self, val_loader: DataLoader, val_type: TokensType = "tokens"
+        self,
+        val_loader: DataLoader,
+        val_type: TokensType = "tokens",
+        use_wandb: Optional[bool] = None,
     ) -> Float[Tensor, "metric=2 move"]:
         metric = t.zeros(2, self.config.trained_on_move + 1, device=self.config.device)
         total_games = 0
@@ -619,7 +621,7 @@ class Probe(t.nn.Module):
         metric /= total_games
 
         mid_pos = metric.shape[1] // 2
-        if self.config.use_wandb:
+        if self.config.use_wandb and use_wandb is not False:
             accu = metric[1]
             wandb.log(
                 {
@@ -683,3 +685,18 @@ class Probe(t.nn.Module):
             batch_size=self.config.batch_size,
             shuffle=shuffle,
         )
+
+
+class HeuristicProbe(Probe):
+    def __init__(self, logits: List[float], model: HookedTransformer, config: ProbeConfig) -> None:
+        super().__init__(model, config)
+        self.logits = logits
+
+    def forward(
+        self,
+        tokens: Tokens,
+        tokens_type: TokensType = "tokens",
+    ) -> Float[Tensor, "game first_moves option"]:
+        assert tokens_type == "tokens", "Heuristic probe only works with tokens"
+        l = t.tensor(self.logits, device=self.config.device)
+        return l[None, None].expand(*tokens.shape, -1)
