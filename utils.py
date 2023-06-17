@@ -291,6 +291,14 @@ def state_stack_to_one_hot(
     return one_hot
 
 
+def state_stack_to_correct_option(state_stack: Float[Tensor, "..."]) -> Int[Tensor, "..."]:
+    """Equivalent to `state_stack_to_one_hot(state_stack).argmax(dim=-1)` but faster."""
+    out = t.zeros(state_stack.shape, dtype=t.int8, device=state_stack.device)
+    out[state_stack == 1] = 2
+    out[state_stack == -1] = 1
+    return out
+
+
 def board_to_tensor(board: str) -> Int[Tensor, "row=8 cols=8"]:
     """Convert a string of 'x', 'o', '.' to a tensor.
 
@@ -728,3 +736,11 @@ def swap_subspace(
 
 
 # %%
+
+def make_deterministic(seed: int = 42):
+    # Ensure deterministic behavior
+    t.backends.cudnn.deterministic = True
+    random.seed(hash(f"setting random seeds {seed}") % 2 ** 32 - 1)
+    np.random.seed(hash(f"improves reproducibility {seed}") % 2 ** 32 - 1)
+    t.manual_seed(hash(f"by removing stochasticity {seed}") % 2 ** 32 - 1)
+    t.cuda.manual_seed_all(hash(f"so runs are repeatable {seed}") % 2 ** 32 - 1)
