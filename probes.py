@@ -1,11 +1,11 @@
 import os
 
+from utils import *
 import wandb
 
-# os.environ["ACCELERATE_DISABLE_RICH"] = "1"
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, TypeAlias
+from typing import Tuple
 
 import einops
 import numpy as np
@@ -19,7 +19,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformer_lens import HookedTransformer
 from plotting import plot_aggregate_metric
 
-from utils import *
 
 try:
     from pytorch_lightning import LightningModule
@@ -377,7 +376,7 @@ class ProbeConfig:
     """The probe will be applied only on the residual stream at this move."""
     layer: int
     """The layer on which the probe is trained."""
-    probe_point: str = "resid_pos"
+    probe_point: str = "resid_post"
     """The activation with this name are the input of the probe."""
     device: str = "cuda"
 
@@ -430,7 +429,7 @@ class ProbeConfig:
 
 
 TokensType = Literal["tokens", "activations"]
-Tokens = Union[Int[Tensor, "game move"], Float[Tensor, "game move"]]
+Tokens = Union[Int[Tensor, "game move"], Float[Tensor, "game dmodel"]]
 
 
 class Probe(t.nn.Module):
@@ -463,7 +462,7 @@ class Probe(t.nn.Module):
         # Get the residual stream of the model on the right layer
         with t.no_grad():
             _, cache = self.model.run_with_cache(
-                tokens.to(self.config.device),
+                tokens[:, : self.config.trained_on_move + 1].to(self.config.device),
                 names_filter=lambda n: n == self.config.act_name,
                 stop_at_layer=self.config.layer + 1,
             )
@@ -480,7 +479,6 @@ class Probe(t.nn.Module):
         assert tokens.shape[1] >= self.config.trained_on_move + 1
 
         # Compute the activations
-        tokens = tokens[:, : self.config.trained_on_move + 1]  # No need for the later ones.
         if tokens_type == "tokens":
             residual_stream = self.get_activations(tokens)
         else:
@@ -489,7 +487,7 @@ class Probe(t.nn.Module):
         # Apply the probe
         return einops.einsum(
             self.probe,
-            residual_stream,
+            residual_stream.to(self.config.device),
             "option move dmodel, game dmodel -> game move option",
         )
 
@@ -501,12 +499,13 @@ class Probe(t.nn.Module):
         per_move: bool = False,
         return_accuracy: bool = False,
     ) -> Tensor:
-        # We don't need tokens further than the trained_on_move
-        tokens = tokens[:, : self.config.trained_on_move + 1]
+        # We don't need states further than the trained_on_move
         cell_state = cell_state[:, : self.config.trained_on_move + 1]
 
-        # Get the correct option
-        correct_option = state_stack_to_correct_option(cell_state)
+        # Get the correct options
+        correct_option = state_stack_to_correct_option(cell_state).to(
+            device=self.config.device, dtype=t.long
+        )
 
         # Get the predictions of the probe
         logits = self(tokens, tokens_type=tokens_type)
@@ -515,13 +514,17 @@ class Probe(t.nn.Module):
         if not self.config.has_blank:
             # Add a fake blank option, with logits of -1000
             new_shape = logits.shape[:-1] + (3,)
-            l = t.full(new_shape, -100, device=correct_option.device, dtype=logits.dtype)
+            l = t.full(new_shape, -100, device=logits.device, dtype=logits.dtype)
             l[..., 1:] = logits
             logits = l
         logits: Int[Tensor, "game move option=3"]
 
+        # Compute the loss
+        print(logits.device, correct_option.device, self.config.device)
         loss = t.nn.functional.cross_entropy(
-            logits.flatten(0, 1), correct_option.flatten(), reduction="none" if per_move else "mean"
+            logits.flatten(0, 1),
+            correct_option.flatten(),
+            reduction="none" if per_move else "mean",
         )
         if per_move:
             loss = loss.reshape(correct_option.shape).mean(0)  # mean on game, keep move
@@ -549,7 +552,9 @@ class Probe(t.nn.Module):
             assert data_type == "tokens", "If train_tokens is a tensor, train_type must be 'tokens'"
             return self.dataloader(data, self.config.num_train_games, shuffle=shuffle)
         else:
-            assert isinstance(data, DataLoader), "train_data must be a tensor or a dataloader"
+            assert isinstance(
+                data, DataLoader
+            ), f"train_data must be a tensor or a dataloader, got: {type(data)}"
             return data
 
     def train_loop(
