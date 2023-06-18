@@ -467,7 +467,6 @@ class Probe(t.nn.Module):
             _, cache = self.model.run_with_cache(
                 tokens,
                 names_filter=lambda n: n == self.config.act_name,
-                # TODO: Allow for a more generic filter
                 stop_at_layer=self.config.layer + 1,
             )
 
@@ -498,12 +497,13 @@ class Probe(t.nn.Module):
         # Big tensor to store the activations on cpu
         activations = t.empty(max_games, self.model.cfg.d_model, device="cpu")
         game = 0
-        for tokens in tqdm(tokens_loader, desc="Computing activations"):
-            activations[game : game + len(tokens)] = self.get_activations(tokens).cpu()
-            game += len(tokens)
+        for (batch,) in tqdm(tokens_loader, desc="Computing activations"):
+            activations[game : game + len(batch)] = self.get_activations(batch).cpu()
+            game += len(batch)
 
+        correct = self.get_correct_answers(tokens[:max_games])
         return DataLoader(
-            TensorDataset(activations, self.get_correct_answers(tokens[:max_games])),
+            TensorDataset(activations, correct),
             batch_size=self.config.batch_size,
             shuffle=not for_validation,
         )
@@ -538,7 +538,7 @@ class Probe(t.nn.Module):
             )
 
         # Apply the probe
-        return self.apply_probe(residual_stream.to(self.config.device))
+        return self.activation_forward(residual_stream.to(self.config.device))
 
     def activation_forward(
         self, activations: Float[Tensor, "*activation dmodel"]
@@ -673,7 +673,7 @@ class Probe(t.nn.Module):
         for batch in val_loader:
             batch_metric = self.loss(*batch, per_probe=True, return_accuracy=True)
             metric += batch_metric * len(batch[0])
-            total_games += len(batch)
+            total_games += len(batch[0])
         metric /= total_games
 
         # Log the metrics if needed
@@ -736,16 +736,21 @@ class OthelloProbe(Probe):
         self, tokens: Int[Tensor, "batch token"]
     ) -> Int[Tensor, "batch probe *activation"]:
         assert (
-            tokens.shape[1] > self.config.trained_on
-        ), f"Only {tokens.shape[1]} moves available but {self.config.trained_on + 1} requested"
+            tokens.shape[1] == self.config.trained_on + 1
+        ), f"Expected {self.config.trained_on + 1} moves, got {tokens.shape[1]}"
 
         row, col = self.config.row_col()
 
-        tokens = tokens[:, : self.config.trained_on + 1]
         states = move_sequence_to_state(tokens_to_board(tokens), mode="mine-their")
         states = states[:, :, row, col]
         states = state_stack_to_correct_option(states)
         states: Int[Tensor, "game move"]  # Index of the correct cell state
+
+        if self.config.options == 2:  # Remove the blank option
+            assert (
+                states > 0
+            ).all(), "Cannot ignore the blank option if as it is present in the data"
+            states -= 1
 
         return states
 
@@ -789,6 +794,8 @@ class StatsProbe(OthelloProbe):
             8,
         ), f"Expected stats to have shape (3, 60, 8, 8), got {stats.shape}"
         row, col = self.config.row_col()
+        if self.config.options == 2:
+            stats = stats[1:]
         # We go from the probability of each cell to logits that correspond to the
         # probabilities. Which are just the log of the probabilities.
         logits = t.log(stats[:, : self.config.trained_on + 1, row, col])
