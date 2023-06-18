@@ -1,14 +1,14 @@
 from typing import Callable, Iterable, List, Dict, Union, Optional, Tuple, Literal
+
+import einops
 import plotly.express as px
 import torch
-import einops
+from jaxtyping import Int
 from torch import Tensor
 from transformer_lens import HookedTransformer, utils
-from jaxtyping import Int, Float, Bool
-from dataclasses import dataclass, field
 
+from plotly_utils import imshow, line
 from utils import logits_to_board, TOKEN_NAMES, CELL_TOKEN_NAMES
-from plotly_utils import hist, imshow, line
 
 try:
     from typing import Self
@@ -57,12 +57,12 @@ class MagicTensor:
 
     # Functions to manipulate the dimensions order/names
 
-    def rearange(self, new_shape: List[str]) -> Self:
+    def rearrange(self, new_shape: List[str]) -> Self:
         value = einops.rearrange(self.value, f"{' '.join(self._shape)} -> {' '.join(new_shape)}")
         return self.edited(value, new_shape)
 
     def by(self, *dims: str, last: bool = False) -> Self:
-        """Rearange the dimensions so that the given ones are first.
+        """Rearrange the dimensions so that the given ones are first.
 
         Args:
             last (bool, optional): If True, put the given dimensions last instead of first. The last dim passed will be the last of the tensor.
@@ -76,7 +76,7 @@ class MagicTensor:
         else:
             new_shape = list(dims) + other
 
-        return self.rearange(new_shape)
+        return self.rearrange(new_shape)
 
     def rename_(self, old: str, new: str) -> None:
         """Rename a dimension inplace"""
@@ -90,8 +90,8 @@ class MagicTensor:
         assert dim not in self._shape, f"Cannot add {dim} to {self}, already present"
         return self.edited(self.value.unsqueeze(-1), self._shape + [dim])
 
-    def _prefered_dim(self, shape: Iterable[str], hint: Optional[str] = None) -> str:
-        """Return the prefered dimension to multiply with.
+    def _preferred_dim(self, shape: Iterable[str], hint: Optional[str] = None) -> str:
+        """Return the preferred dimension to multiply with.
 
         This always return a dimension present in `self._shape` and `shape`.
         If hint is given and in both shapes, return it.
@@ -106,11 +106,11 @@ class MagicTensor:
             return next(iter(intersection))
         elif hint is not None:
             raise ValueError(
-                f"Could not find a prefered dim to multiply between {self._shape} and {shape}. Hint '{hint}' not in intersection {intersection}"
+                f"Could not find a preferred dim to multiply between {self._shape} and {shape}. Hint '{hint}' not in intersection {intersection}"
             )
         else:
             raise ValueError(
-                f"Could not find a prefered dim to multiply between {self._shape} and {shape}"
+                f"Could not find a preferred dim to multiply between {self._shape} and {shape}"
             )
 
     def _dim_name_to_index(self, dim: Optional[str] = None) -> int:
@@ -123,7 +123,7 @@ class MagicTensor:
         if dim is None:
             assert (
                 len(self._shape) == 1
-            ), f"Implicit dimention is possible only for 1D tensor. Got: {self}."
+            ), f"Implicit dimension is possible only for 1D tensor. Got: {self}."
             return 0
         elif isinstance(dim, str):
             assert dim in self._shape, f"Dimension {dim} not in {self._shape}"
@@ -143,6 +143,8 @@ class MagicTensor:
 
         if isinstance(dim, str):
             dim_index = self._dim_name_to_index(dim)
+        else:
+            dim_index = dim
 
         return self._shape[:dim_index] + self._shape[dim_index + 1 :]
 
@@ -194,7 +196,7 @@ class MagicTensor:
         value = logits_to_board(out.value, "logits", fill_value=fill)
         return out.edited(value, out._shape[:-1] + ["row", "col"])
 
-    # Functions of arrity 1
+    # Functions of arity 1
 
     def softmax(self, dim: Optional[str] = None) -> Self:
         """Apply softmax along the given dimension."""
@@ -260,22 +262,22 @@ class MagicTensor:
         """Apply a function to the tensor."""
         return self.apply(func)
 
-    # Functions of arriy 2
+    # Functions of arity 2
 
     def _mul(
         self,
         other: Tensor,
         other_shape: List[str],
         bias: Optional[Tensor] = None,
-        prefered_dim: Optional[str] = None,
+        preferred_dim: Optional[str] = None,
     ) -> Self:
         """Multiply the tensor with another one, automatically finding the dimension to multiply.
 
         Args:
             other (Tensor): The other tensor to multiply with.
             other_shape (List[str]): The shape of the other tensor.
-            bias (Optional[Tensor], optional): Optianally add a bias. Bias is assumed to have the same shape as other, except for the dim that is multiplied.
-            prefered_dim (Optional[str], optional): If given, use this dimension to multiply (according to Circuit._prefered_dim).
+            bias (Optional[Tensor], optional): Optionally add a bias. Bias is assumed to have the same shape as other, except for the dim that is multiplied.
+            preferred_dim (Optional[str], optional): If given, use this dimension to multiply (according to Circuit._preferred_dim).
 
         Returns:
             Self: self * other + bias
@@ -294,7 +296,7 @@ class MagicTensor:
 
         # Find the dimension on which to multiply
         possible_multiplied_dims = set(self._shape) & set(other_shape)
-        dim = self._prefered_dim(possible_multiplied_dims, prefered_dim)
+        dim = self._preferred_dim(possible_multiplied_dims, preferred_dim)
 
         pattern_1 = " ".join(self._shape)
         pattern_2 = " ".join(other_shape)
@@ -327,7 +329,6 @@ class MagicTensor:
         One of the shape must be a subset of the other. The addition broadcast on the other dims.
         See also: Circuit.new_dim to extend a shape.
         """
-        assert self.model is other.model, "Both circuits must have the same model"
 
         # We keep the one with the largest number of dimensions
         if len(self._shape) < len(other._shape):
@@ -415,7 +416,7 @@ class MagicTensor:
 
             try:
                 imshow(self.value, **kwargs)
-            except Exception as e:
+            except Exception:
                 print("Error while plotting", self)
                 raise
 
@@ -484,7 +485,7 @@ class Kuit(MagicTensor):
         """Multiply self with the positional embedding matrix.
 
         Args:
-            normalize (bool, optional): If True, normalize the positional embedding. Useful to simulate a layernorm.
+            normalize (bool, optional): If True, normalize the positional embedding. Useful to simulate a LayerNorm.
             max_pos (Optional[int], optional): If given, only use the first max_pos positions.
 
         New dimensions: pos, dmodel. Possibly "pos_1", "pos_2" if multiplying along dmodel and self has a pos dimension.
@@ -560,7 +561,7 @@ class Kuit(MagicTensor):
             dims_o = ["dhead", "dmodel"]
 
         out = self._mul(self.model.W_V[index], dims_v)
-        out = out._mul(self.model.W_O[index], dims_o, prefered_dim="dhead")
+        out = out._mul(self.model.W_O[index], dims_o, preferred_dim="dhead")
         return out.add(Kuit(self.model, self.model.b_O[layer], ["dmodel"]))
 
     def qk(
@@ -575,7 +576,7 @@ class Kuit(MagicTensor):
             key (Circuit): The key of the QK circuit (the query is self).
 
         New dimensions: Any repeated dimensions in both the key and query are suffixed with "_q" and "_k" respectively.
-        If both have a "pos" dimension, the apply a triangular mask to simulate the attention mask.
+        If both have a "pos" dimension, apply a triangular mask to simulate the attention mask.
         """
         assert self.model is key.model, "Both circuits must have the same model"
 
@@ -595,22 +596,24 @@ class Kuit(MagicTensor):
         dims += ["dmodel", "dhead"]
 
         # Apply the query
-        query = self._mul(self.model.W_Q[index], dims, self.model.b_Q[index], prefered_dim="dmodel")
+        query = self._mul(
+            self.model.W_Q[index], dims, self.model.b_Q[index], preferred_dim="dmodel"
+        )
 
         # Apply the key
-        key = key._mul(self.model.W_K[index], dims, self.model.b_K[index], prefered_dim="dmodel")
+        key = key._mul(self.model.W_K[index], dims, self.model.b_K[index], preferred_dim="dmodel")
 
         # Combine the two
         # Find the intersection of the two shapes
         possible_multiplied_dims = (
             set(query._shape) & set(key._shape) - {"dhead", "head", "layer"} - self.BATCH_NAMES
         )
-        # We always want to match the head dimension, and there might be an other dimension
-        # that is shared between the two, which we dont want to match
+        # We always want to match the head dimension, and there might be another dimension
+        # that is shared between the two, which we don't want to match
         query._shape = [d + "_q" if d in possible_multiplied_dims else d for d in query._shape]
         key._shape = [d + "_k" if d in possible_multiplied_dims else d for d in key._shape]
 
-        out = query._mul(key.value, key._shape, prefered_dim="dhead")
+        out = query._mul(key.value, key._shape, preferred_dim="dhead")
 
         # If we have two "pos" dimensions, use the mask to simulate the triangular matrix
         tokens_dims = ["pos_q", "pos_k"]
@@ -637,11 +640,15 @@ class Kuit(MagicTensor):
 
 
 if __name__ == "__main__":
-    from utils import get_othello_gpt
 
-    cfg, model = get_othello_gpt("cpu")
+    def test():
+        from utils import get_othello_gpt
 
-    c = Kuit(model)
-    c.embedding().plot()
+        cfg, model = get_othello_gpt("cpu")
 
-    c.unembed().by("dmodel").plot(height=800)
+        c = Kuit(model)
+        c.embedding().plot()
+
+        c.unembed().by("dmodel").plot(height=800)
+
+    test()

@@ -2,7 +2,7 @@ import copy
 import dataclasses
 import os
 
-from circuit import MagicTensor
+from magic_tensor import MagicTensor
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
     plot_single_board,
     plot_board,
