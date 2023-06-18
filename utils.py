@@ -1,21 +1,20 @@
 # %%
 import os
 import random
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple, Union
-import joblib
 
 import einops
+import joblib
 import numpy as np
 import torch as t
 import torch.nn.functional as F
 import transformer_lens.utils as utils
-from IPython.display import display
+from dataclasses import dataclass
 from jaxtyping import Bool, Float, Int
-from torch import Tensor, fill
-from tqdm.notebook import tqdm, trange
+from torch import Tensor
+from tqdm.auto import tqdm, trange
 from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformer_lens.hook_points import HookPoint
 
