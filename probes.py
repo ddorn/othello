@@ -1,3 +1,4 @@
+import dataclasses
 import os
 
 from utils import *
@@ -413,12 +414,6 @@ class Probe(t.nn.Module):
         def name(self) -> str:
             return f"probe_{self.layer}_{self.act_name}_{self.num_probes}x{self.options}"
 
-        def load(self, model: HookedTransformer) -> "Probe":
-            weight = t.load(PROBE_DIR / f"{self.name()}.pt")
-            probe = Probe(model, self)
-            probe.probe = weight
-            return probe
-
     def __init__(self, model: HookedTransformer, config: Config) -> None:
         super().__init__()
         self.config = config
@@ -693,6 +688,14 @@ class Probe(t.nn.Module):
             )
         return metric
 
+    @classmethod
+    def load(cls, model: HookedTransformer, **config_args) -> "Probe":
+        config = cls.Config(**config_args)
+        weight = t.load(PROBE_DIR / f"{config.name()}.pt")
+        probe = cls(model, config)
+        probe.probe = weight
+        return probe
+
     def save(self, force: bool = False) -> None:
         path = PROBE_DIR / f"{self.config.name}.pt"
         if path.exists() and not force:
@@ -728,7 +731,7 @@ class OthelloProbe(Probe):
             return self.num_probes - 1
 
         def name(self) -> str:
-            return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.num_probes}"
+            return f"probe-{self.cell}-L{self.layer}{self.probe_point}-M{self.trained_on}"
 
     config: Config
 
@@ -747,9 +750,8 @@ class OthelloProbe(Probe):
         states: Int[Tensor, "game move"]  # Index of the correct cell state
 
         if self.config.options == 2:  # Remove the blank option
-            assert (
-                states > 0
-            ).all(), "Cannot ignore the blank option if as it is present in the data"
+            # noinspection PyUnresolvedReferences
+            assert (states > 0).all(), "Blank option in the data!"
             states -= 1
 
         return states
@@ -759,6 +761,9 @@ class OthelloProbe(Probe):
     ) -> Float[Tensor, "game dmodel"]:
         # Get the residual stream at the move where the probe is trained
         return cache[:, self.config.trained_on, :]
+
+
+# Baselines
 
 
 class ConstantProbe(OthelloProbe):
@@ -773,7 +778,7 @@ class ConstantProbe(OthelloProbe):
         tokens: Tokens,
     ) -> Float[Tensor, "game first_moves option"]:
         assert tokens.dtype == t.int64, f"Expected int64, got {tokens.dtype}"
-        l = t.tensor(self.logits, device=self.config.device)
+        l = t.tensor(self.logits, device=self.config.device, dtype=t.float32)
         return l[None, None].expand(*tokens.shape, -1)
 
 
@@ -809,3 +814,23 @@ class StatsProbe(OthelloProbe):
         assert tokens_type == "tokens", "Heuristic probe only works with tokens"
 
         return self.logits[None].expand(tokens.shape[0], -1, -1).to(self.config.device)
+
+
+def baselines(probes, val_data, type: Literal["random", "stats"] = "random"):
+    if type == "stats":
+        stats = t.load(STATS_PATH)
+    else:
+        stats = []
+
+    baseline_probes = []
+    for probe in probes:
+        config = OthelloProbe.Config(**dataclasses.asdict(probe.config))
+        config.use_wandb = False
+        if type == "random":
+            baseline_probes.append(ConstantProbe([1] * config.options, probe.model, config))
+        elif type == "stats":
+            baseline_probes.append(StatsProbe(stats[:3], probe.model, config))
+        else:
+            raise ValueError(f"Unknown baseline type {type}")
+
+    return t.stack([probe.validate(val_data) for probe in baseline_probes])
