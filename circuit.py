@@ -29,10 +29,12 @@ class MagicTensor:
         self.value = value
         self._shape = shape
 
-        assert self.value.ndim == len(self._shape), f"Shape {self._shape} does not match value shape {self.value.shape}"
+        assert self.value.ndim == len(
+            self._shape
+        ), f"Shape {self._shape} does not match value shape {self.value.shape}"
 
     def __repr__(self) -> str:
-        shape = ', '.join(f'{dim}={size}' for dim, size in zip(self._shape, self.value.shape))
+        shape = ", ".join(f"{dim}={size}" for dim, size in zip(self._shape, self.value.shape))
         return f"{self.__class__.__name__}({shape})"
 
     @property
@@ -108,7 +110,8 @@ class MagicTensor:
             )
         else:
             raise ValueError(
-                f"Could not find a prefered dim to multiply between {self._shape} and {shape}")
+                f"Could not find a prefered dim to multiply between {self._shape} and {shape}"
+            )
 
     def _dim_name_to_index(self, dim: Optional[str] = None) -> int:
         """Convert a dimension name to its index in the shape.
@@ -118,8 +121,9 @@ class MagicTensor:
         """
 
         if dim is None:
-            assert len(self._shape
-                       ) == 1, f"Implicit dimention is possible only for 1D tensor. Got: {self}."
+            assert (
+                len(self._shape) == 1
+            ), f"Implicit dimention is possible only for 1D tensor. Got: {self}."
             return 0
         elif isinstance(dim, str):
             assert dim in self._shape, f"Dimension {dim} not in {self._shape}"
@@ -127,9 +131,9 @@ class MagicTensor:
         else:
             raise ValueError(f"Invalid dimension type: {type(dim)}")
 
-    def _get_shape_without(self,
-                           dim: Optional[Union[str, int]] = None,
-                           keepdim: bool = False) -> List[str]:
+    def _get_shape_without(
+        self, dim: Optional[Union[str, int]] = None, keepdim: bool = False
+    ) -> List[str]:
         """Return the shape without the given dimension.
 
         If keepdim is True, return the current shape.
@@ -140,7 +144,7 @@ class MagicTensor:
         if isinstance(dim, str):
             dim_index = self._dim_name_to_index(dim)
 
-        return self._shape[:dim_index] + self._shape[dim_index + 1:]
+        return self._shape[:dim_index] + self._shape[dim_index + 1 :]
 
     def __getitem__(self, index: Union[int, slice, Tuple[str, Union[int, slice]]]) -> Self:
         """Index the tensor along one dimension.
@@ -179,18 +183,16 @@ class MagicTensor:
         assert "row" not in self._shape, f"Cannot convert to board, already has a row dimension"
         assert "col" not in self._shape, f"Cannot convert to board, already has a col dimension"
 
-        vocab_dims = [d for d in self._shape if d.startswith("vocab")]
         if dim is None:
+            vocab_dims = [d for d in self._shape if d.startswith("vocab")]
             assert len(vocab_dims) == 1, f"Cannot infer which dimension to use: {vocab_dims}"
             dim = vocab_dims[0]
-        else:
-            assert dim in vocab_dims, f"Dimension {dim} not a vocabulary dimension. Options: {vocab_dims}"
 
         # move the dimension to the end
         out = self.by(dim, last=True)
 
-        value = logits_to_board(out.value, 'logits', fill_value=fill)
-        return out.edited(value, out._shape[:-1] + ['row', 'col'])
+        value = logits_to_board(out.value, "logits", fill_value=fill)
+        return out.edited(value, out._shape[:-1] + ["row", "col"])
 
     # Functions of arrity 1
 
@@ -214,8 +216,9 @@ class MagicTensor:
     def remove_diag(self) -> Self:
         """Set the diagonal of the last two dimensions to 0."""
         assert len(self._shape) >= 2, f"Cannot remove diag of {self}, not enough dimensions"
-        assert self.value.shape[-1] == self.value.shape[
-            -2], f"Cannot remove diag of {self}, last two dimensions are not equal"
+        assert (
+            self.value.shape[-1] == self.value.shape[-2]
+        ), f"Cannot remove diag of {self}, last two dimensions are not equal"
         return self.edited(self.value - self.value.diag().diag())
 
     def flatten(self, *dims: str, new_name: Optional[str] = None) -> Self:
@@ -234,7 +237,7 @@ class MagicTensor:
 
         if new_name is None:
             new_name = f"flat_{'_'.join(dims)}"
-        new_shape = out._shape[:-len(dims)] + [new_name]
+        new_shape = out._shape[: -len(dims)] + [new_name]
         value = self.value.flatten(len(new_shape) - 1)
 
         return out.edited(value, new_shape)
@@ -248,7 +251,9 @@ class MagicTensor:
     def apply(self, func: Callable[[Tensor], Tensor]) -> Self:
         """Apply a function to the tensor."""
         out = func(self.value)
-        assert out.shape == self.value.shape, f"Function changed the shape of {self} to {out.shape}. Shape must be kept."
+        assert (
+            out.shape == self.value.shape
+        ), f"Function changed the shape of {self} to {out.shape}. Shape must be kept."
         return self.edited(out)
 
     def __call__(self, func: Callable[[Tensor], Tensor]) -> Self:
@@ -257,11 +262,13 @@ class MagicTensor:
 
     # Functions of arriy 2
 
-    def _mul(self,
-             other: Tensor,
-             other_shape: List[str],
-             bias: Optional[Tensor] = None,
-             prefered_dim: Optional[str] = None) -> Self:
+    def _mul(
+        self,
+        other: Tensor,
+        other_shape: List[str],
+        bias: Optional[Tensor] = None,
+        prefered_dim: Optional[str] = None,
+    ) -> Self:
         """Multiply the tensor with another one, automatically finding the dimension to multiply.
 
         Args:
@@ -276,7 +283,8 @@ class MagicTensor:
 
         # Check that the other shape is coherent
         assert len(other.shape) == len(
-            other_shape), f"Shape {other_shape} does not match value shape {other.shape}"
+            other_shape
+        ), f"Shape {other_shape} does not match value shape {other.shape}"
         # Check that no dim is repeated in each tensor
         assert len(set(self._shape)) == len(self._shape), f"Repeated dimensions in {self._shape}"
         assert len(set(other_shape)) == len(other_shape), f"Repeated dimensions in {other_shape}"
@@ -291,9 +299,10 @@ class MagicTensor:
         pattern_1 = " ".join(self._shape)
         pattern_2 = " ".join(other_shape)
 
-        shape = [d for d in self._shape if d != dim
-                 ] + [d for d in other_shape if d not in possible_multiplied_dims]
-        pattern_target = ' '.join(shape)
+        shape = [d for d in self._shape if d != dim] + [
+            d for d in other_shape if d not in possible_multiplied_dims
+        ]
+        pattern_target = " ".join(shape)
 
         value = einops.einsum(
             self.value,
@@ -304,12 +313,14 @@ class MagicTensor:
         if bias is not None:
             bias_shape = [d for d in other_shape if d != dim]
             assert len(bias.shape) == len(
-                bias_shape), f"Shape {bias_shape} does not match value shape {bias.shape}"
+                bias_shape
+            ), f"Shape {bias_shape} does not match value shape {bias.shape}"
             target_shape = [d if d in bias_shape else "1" for d in shape]  # broadcast the bias
             bias = einops.rearrange(bias, f"{' '.join(bias_shape)} -> {' '.join(target_shape)}")
             value += bias
 
         return self.edited(value, shape)
+
     def add(self, other: Self) -> Self:
         """Add the value of the other circuit to this one.
 
@@ -325,80 +336,82 @@ class MagicTensor:
         assert set(other.shape) <= set(self.shape), f"Cannot add {other.shape} to {self.shape}"
 
         other_new_shape = [d if d in other._shape else "1" for d in self._shape]
-        other_value = einops.rearrange(other.value,
-                                       f"{' '.join(other._shape)} -> {' '.join(other_new_shape)}")
+        other_value = einops.rearrange(
+            other.value, f"{' '.join(other._shape)} -> {' '.join(other_new_shape)}"
+        )
 
         return self.edited(self.value + other_value)
 
     def histogram(self, **kwargs) -> Self:
-        return self.plot('histogram', **kwargs)
+        return self.plot("histogram", **kwargs)
 
     def line(self, **kwargs) -> Self:
-        return self.plot('line', **kwargs)
+        return self.plot("line", **kwargs)
 
-    def plot(self, plot_type: Literal['imshow', 'line', 'histogram'] = 'imshow', **kwargs) -> Self:
+    def plot(self, plot_type: Literal["imshow", "line", "histogram"] = "imshow", **kwargs) -> Self:
         """Plot the tensor!
 
         TODO: Document how the plot is made.
         """
 
-        if self.value.ndim == 1 and plot_type == 'imshow':
-            plot_type = 'line'
+        if self.value.ndim == 1 and plot_type == "imshow":
+            plot_type = "line"
 
-        dim_plot = 2 if plot_type == 'imshow' else 1
+        dim_plot = 2 if plot_type == "imshow" else 1
 
         if len(self._shape) > dim_plot:
             facet_dim = (-dim_plot - 1) % len(self._shape)
             facet_name = self._shape[facet_dim]
             nb_plots = self.value.shape[facet_dim]
-            kwargs.setdefault('facet_col', facet_dim)
-            if 'facet_col_wrap' in kwargs:
-                wrap = kwargs['facet_col_wrap']
+            kwargs.setdefault("facet_col", facet_dim)
+            if "facet_col_wrap" in kwargs:
+                wrap = kwargs["facet_col_wrap"]
             elif nb_plots < 4:
                 wrap = nb_plots
             elif nb_plots == 4:
                 wrap = 2
             else:
                 wrap = 3
-            kwargs.setdefault('facet_col_wrap', wrap)
-            kwargs.setdefault('height', 500 * (nb_plots // wrap))
+            kwargs.setdefault("facet_col_wrap", wrap)
+            kwargs.setdefault("height", 500 * (nb_plots // wrap))
 
-            if facet_name.startswith('head'):
-                kwargs.setdefault('facet_labels', [f"Head {i}" for i in range(nb_plots)])
-            elif facet_name.startswith('layer'):
-                kwargs.setdefault('facet_labels', [f"Layer {i}" for i in range(nb_plots)])
+            if facet_name.startswith("head"):
+                kwargs.setdefault("facet_labels", [f"Head {i}" for i in range(nb_plots)])
+            elif facet_name.startswith("layer"):
+                kwargs.setdefault("facet_labels", [f"Layer {i}" for i in range(nb_plots)])
             else:
                 print(f"Warning: Don't know how to label {facet_name}")
 
         if len(self._shape) == dim_plot + 2:
-            kwargs.setdefault('animation_frame', 0)
+            kwargs.setdefault("animation_frame", 0)
         elif len(self._shape) > dim_plot + 2:
             raise ValueError(f"Cannot plot {self}: Too many dimensions.")
 
-        kwargs.setdefault('title', str(self))
+        kwargs.setdefault("title", str(self))
 
-        if plot_type == 'histogram':
+        if plot_type == "histogram":
             from rich import print as rprint
+
             rprint(kwargs)
             px.histogram(x=utils.to_numpy(self.value), **kwargs).show()
             return self
 
         x_name = self._shape[-1]
-        kwargs.setdefault('xaxis_title', x_name)
-        if x_name.startswith('vocab'):
+        kwargs.setdefault("xaxis_title", x_name)
+        if x_name.startswith("vocab"):
             if self.shape[x_name] == len(TOKEN_NAMES):
-                kwargs.setdefault('x', TOKEN_NAMES)
+                kwargs.setdefault("x", TOKEN_NAMES)
             elif self.shape[x_name] == len(CELL_TOKEN_NAMES):
-                kwargs.setdefault('x', CELL_TOKEN_NAMES)
+                kwargs.setdefault("x", CELL_TOKEN_NAMES)
 
-        if plot_type == 'imshow':
+        if plot_type == "imshow":
             y_name = self._shape[-2]
-            kwargs.setdefault('yaxis_title', y_name)
-            if y_name.startswith('vocab'):
+            kwargs.setdefault("yaxis_title", y_name)
+            if y_name.startswith("vocab"):
                 if self.shape[y_name] == len(TOKEN_NAMES):
-                    kwargs.setdefault('y', TOKEN_NAMES)
+                    kwargs.setdefault("y", TOKEN_NAMES)
                 elif self.shape[y_name] == len(CELL_TOKEN_NAMES):
-                    kwargs.setdefault('y', CELL_TOKEN_NAMES)
+                    kwargs.setdefault("y", CELL_TOKEN_NAMES)
 
             try:
                 imshow(self.value, **kwargs)
@@ -406,9 +419,9 @@ class MagicTensor:
                 print("Error while plotting", self)
                 raise
 
-        elif plot_type == 'line':
+        elif plot_type == "line":
             # kwargs.setdefault('xaxis', x_name)
-            kwargs.setdefault('xaxis_title', x_name)
+            kwargs.setdefault("xaxis_title", x_name)
             line(self.value, **kwargs)
         else:
             raise ValueError(f"Unknown type: {plot_type}")
@@ -426,9 +439,14 @@ class Kuit(MagicTensor):
 
     model: HookedTransformer
 
-    BATCH_NAMES = {'batch', 'game'}
+    BATCH_NAMES = {"batch", "game"}
 
-    def __init__(self, model: HookedTransformer, value: Optional[Tensor] = None, shape: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        model: HookedTransformer,
+        value: Optional[Tensor] = None,
+        shape: Optional[List[str]] = None,
+    ) -> None:
         self.model = model
         if shape is None:
             shape = []
@@ -454,7 +472,9 @@ class Kuit(MagicTensor):
         if normalize:
             we = we / we.norm(dim=1, keepdim=True)
 
-        if 'vocab' in self._shape and 'dmodel' in self._shape:  # Prefer multiply of dmodel than vocab
+        if (
+            "vocab" in self._shape and "dmodel" in self._shape
+        ):  # Prefer multiply of dmodel than vocab
             self.rename_("vocab", "vocab_1")
             return self._mul(we, ["vocab_2", "dmodel"])
         else:
@@ -475,7 +495,7 @@ class Kuit(MagicTensor):
         if normalize:
             pos = pos / pos.norm(dim=1, keepdim=True)
 
-        if 'pos' in self._shape:
+        if "pos" in self._shape:
             self.rename_("pos", "pos_1")
             return self._mul(pos, ["pos_2", "dmodel"])
         else:
@@ -489,12 +509,12 @@ class Kuit(MagicTensor):
         """
 
         # Here, we assume that we want to multiply along dmodel.
-        if 'vocab' in self._shape and 'dmodel' in self._shape:
+        if "vocab" in self._shape and "dmodel" in self._shape:
             # Multiply along dmodel
             self.rename_("vocab", "vocab_in")
-            shape = ['dmodel', 'vocab_out']
+            shape = ["dmodel", "vocab_out"]
         else:
-            shape = ['dmodel', 'vocab']
+            shape = ["dmodel", "vocab"]
 
         return self._mul(self.model.W_U, shape, self.model.b_U if bias else None)
 
@@ -504,9 +524,11 @@ class Kuit(MagicTensor):
             return self.edited(self.model.b_U, ["vocab_out"])
         return self.add(Kuit(self.model, self.model.b_U, ["vocab_out"]))
 
-    def embed(self, tokens: Int[Tensor, '*game token'],
-              positional: bool = True,
-        ) -> Self:
+    def embed(
+        self,
+        tokens: Int[Tensor, "*game token"],
+        positional: bool = True,
+    ) -> Self:
         """Embed the given tokens."""
 
         assert tokens.ndim < 4, f"Cannot embed {tokens.shape}, too many dimensions"
@@ -515,9 +537,9 @@ class Kuit(MagicTensor):
 
         if positional:
             print(embedded.shape, self.model.W_pos.shape)
-            embedded += self.model.W_pos[:embedded.shape[-2]]
+            embedded += self.model.W_pos[: embedded.shape[-2]]
 
-        shape = ['game', 'pos', 'dmodel'][-len(embedded.shape):]
+        shape = ["game", "pos", "dmodel"][-len(embedded.shape) :]
         return self._mul(embedded, shape)
 
     # Specific circuits
@@ -529,7 +551,7 @@ class Kuit(MagicTensor):
         """
 
         if head is None:
-            index = (layer, )
+            index = (layer,)
             dims_v = ["head", "dmodel", "dhead"]
             dims_o = ["head", "dhead", "dmodel"]
         else:
@@ -538,15 +560,12 @@ class Kuit(MagicTensor):
             dims_o = ["dhead", "dmodel"]
 
         out = self._mul(self.model.W_V[index], dims_v)
-        out = out._mul(self.model.W_O[index], dims_o, prefered_dim='dhead')
+        out = out._mul(self.model.W_O[index], dims_o, prefered_dim="dhead")
         return out.add(Kuit(self.model, self.model.b_O[layer], ["dmodel"]))
 
-    def qk(self,
-           layer: Optional[int],
-           head: Optional[int] = None,
-           softmax: bool = False,
-           *,
-           key: Self) -> Self:
+    def qk(
+        self, layer: Optional[int], head: Optional[int] = None, softmax: bool = False, *, key: Self
+    ) -> Self:
         """Compute the query-key matrix.
 
         Args:
@@ -566,12 +585,12 @@ class Kuit(MagicTensor):
         if layer is None:
             dims += ["layer"]
         else:
-            index = (layer, )
+            index = (layer,)
 
         if head is None:
             dims += ["head"]
         else:
-            index += (head, )
+            index += (head,)
 
         dims += ["dmodel", "dhead"]
 
@@ -583,7 +602,9 @@ class Kuit(MagicTensor):
 
         # Combine the two
         # Find the intersection of the two shapes
-        possible_multiplied_dims = set(query._shape) & set(key._shape) - {'dhead', 'head', 'layer'} - self.BATCH_NAMES
+        possible_multiplied_dims = (
+            set(query._shape) & set(key._shape) - {"dhead", "head", "layer"} - self.BATCH_NAMES
+        )
         # We always want to match the head dimension, and there might be an other dimension
         # that is shared between the two, which we dont want to match
         query._shape = [d + "_q" if d in possible_multiplied_dims else d for d in query._shape]
@@ -597,12 +618,12 @@ class Kuit(MagicTensor):
             # Reshape to put pos_q and pos_k at the end
             out = out.by(*tokens_dims, last=True)
 
-            size = out.shape['pos_q']
+            size = out.shape["pos_q"]
             mask = torch.triu(torch.ones(size, size), diagonal=1).to(out.value.device, bool)
             out.value.masked_fill_(mask, float("-inf"))
 
             if softmax:
-                out = out.softmax(dim='pos_k')
+                out = out.softmax(dim="pos_k")
 
         return out
 
@@ -618,9 +639,9 @@ class Kuit(MagicTensor):
 if __name__ == "__main__":
     from utils import get_othello_gpt
 
-    cfg, model = get_othello_gpt('cpu')
+    cfg, model = get_othello_gpt("cpu")
 
     c = Kuit(model)
     c.embedding().plot()
 
-    c.unembed().by('dmodel').plot(height=800)
+    c.unembed().by("dmodel").plot(height=800)

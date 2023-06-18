@@ -26,7 +26,8 @@ if not OTHELLO_ROOT.exists():
     os.system("git clone https://github.com/likenneth/othello_world")
 
 from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
-    OthelloBoardState, )
+    OthelloBoardState,
+)
 
 # Conversion methods
 
@@ -99,7 +100,7 @@ def logits_to_board(
     assert x.shape[-1] == 60, f"Expected logits to have 60 items, got {x.shape[-1]}"
 
     extra_shape = x.shape[:-1]
-    temp_board_state = t.zeros((*extra_shape, 64), dtype=t.float32, device=logits.device)
+    temp_board_state = t.zeros((*extra_shape, 64), dtype=logits.dtype, device=logits.device)
     temp_board_state[..., TOKENS_TO_BOARD[1:]] = x
     # Set all cells to -13 by default, for a very negative log prob - this means the middle cells don't show up as mattering
     if mode in ("log_prob", "logits") and fill_value is None:
@@ -129,8 +130,9 @@ def get_othello_gpt(device: str) -> Tuple[HookedTransformerConfig, HookedTransfo
     )
     model = HookedTransformer(cfg).to(device)
 
-    sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens",
-                                     "synthetic_model.pth")
+    sd = utils.download_file_from_hf(
+        "NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth"
+    )
     # champion_ship_sd = utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "championship_model.pth")
     model.load_state_dict(sd)
 
@@ -153,10 +155,12 @@ def load_sample_games(
 
 
     """
-    full_games_tokens = t.tensor(np.load(OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"),
-                                 dtype=t.long)
-    full_games_board_index = t.tensor(np.load(OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"),
-                                      dtype=t.long)
+    full_games_tokens = t.tensor(
+        np.load(OTHELLO_MECHINT_ROOT / "board_seqs_int_small.npy"), dtype=t.long
+    )
+    full_games_board_index = t.tensor(
+        np.load(OTHELLO_MECHINT_ROOT / "board_seqs_string_small.npy"), dtype=t.long
+    )
 
     assert all([middle_sq not in full_games_board_index for middle_sq in [27, 28, 35, 36]])
     assert full_games_tokens.max() == 60
@@ -177,7 +181,7 @@ def load_sample_games(
 # %%
 def one_hot(list_of_ints: List[int], num_classes=64) -> Float[Tensor, "num_classes"]:
     """Encode a list of ints into a one-hot vector of length `num_classes`"""
-    out = t.zeros((num_classes, ), dtype=t.float32)
+    out = t.zeros((num_classes,), dtype=t.float32)
     out[list_of_ints] = 1.0
     return out
 
@@ -223,14 +227,15 @@ def move_sequence_to_state(
 
     # Speed up the computation by doing it in parallel
     nb_games = moves_board_index.shape[0]
-    if nb_games > 10_000:
+    if nb_games >= 10_000:
         stack = joblib.Parallel(n_jobs=-1)(
-            joblib.delayed(move_sequence_to_state)(moves_board_index[i:i + 1000], mode=mode)
+            joblib.delayed(move_sequence_to_state)(moves_board_index[i : i + 1000], mode=mode)
             for i in tqdm(
                 range(0, nb_games, 1000),
                 desc="Converting moves to states",
                 unit=" thousand games",
-            ))
+            )
+        )
         return t.cat(stack, dim=0)
     elif nb_games > 1_000:
         iterator = tqdm(moves_board_index, desc="Converting moves to states")
@@ -240,7 +245,7 @@ def move_sequence_to_state(
     if mode == "valid":
         dtype = t.bool
     elif mode == "turn":
-        dtype = t.int8
+        dtype = t.int
     else:
         dtype = t.float32
 
@@ -267,9 +272,7 @@ def move_sequence_to_state(
 
 
 # %%
-def state_stack_to_one_hot(
-    state_stack: Float[Tensor, "..."]
-) -> Bool[Tensor, "... options=3"]:
+def state_stack_to_one_hot(state_stack: Float[Tensor, "..."]) -> Bool[Tensor, "... options=3"]:
     """
     Creates a tensor of shape (games, moves, rows=8, cols=8, options=3), where the [g, m, r, c, :]-th entry
     is a one-hot encoded vector for the state of game g at move m, at row r and column c. In other words, this
@@ -293,7 +296,7 @@ def state_stack_to_one_hot(
 
 def state_stack_to_correct_option(state_stack: Float[Tensor, "..."]) -> Int[Tensor, "..."]:
     """Equivalent to `state_stack_to_one_hot(state_stack).argmax(dim=-1)` but faster."""
-    out = t.zeros(state_stack.shape, dtype=t.int8, device=state_stack.device)
+    out = t.zeros(state_stack.shape, dtype=t.int, device=state_stack.device)
     out[state_stack == 1] = 2
     out[state_stack == -1] = 1
     return out
@@ -310,7 +313,7 @@ def board_to_tensor(board: str) -> Int[Tensor, "row=8 cols=8"]:
     lines = [line.strip() for line in lines]
     assert all(len(line) == 8 for line in lines)
     data = [[0 if c == "." else 1 if c == "x" else -1 for c in line] for line in lines]
-    return t.tensor(data, dtype=t.int8)
+    return t.tensor(data, dtype=t.int)
 
 
 # %%
@@ -335,26 +338,30 @@ class Metrics:
     """The number of false negatives (moves that were predicted to be invalid but were valid)"""
 
     def __str__(self) -> str:
-        return ("Metrics:\n"
-                f"Loss: {self.loss:.4f}\n"
-                # Acuracy is in percentage (format: 99.99%)
-                f"Cell accuracy: {self.cell_accuracy:.2%}\n"
-                f"Board accuracy: {self.board_accuracy:.2%}\n"
-                f"True positives: {self.true_positives:.2%}\n"
-                f"True negatives: {self.true_negatives:.2%}\n"
-                f"False positives: {self.false_positives:.2%}\n"
-                f"False negatives: {self.false_negatives:.2%}\n")
+        return (
+            "Metrics:\n"
+            f"Loss: {self.loss:.4f}\n"
+            # Acuracy is in percentage (format: 99.99%)
+            f"Cell accuracy: {self.cell_accuracy:.2%}\n"
+            f"Board accuracy: {self.board_accuracy:.2%}\n"
+            f"True positives: {self.true_positives:.2%}\n"
+            f"True negatives: {self.true_negatives:.2%}\n"
+            f"False positives: {self.false_positives:.2%}\n"
+            f"False negatives: {self.false_negatives:.2%}\n"
+        )
 
     def to_tensor(self) -> Float[Tensor, "metrics=7"]:
-        return t.tensor([
-            self.loss,
-            self.cell_accuracy,
-            self.board_accuracy,
-            self.true_positives,
-            self.true_negatives,
-            self.false_positives,
-            self.false_negatives,
-        ])
+        return t.tensor(
+            [
+                self.loss,
+                self.cell_accuracy,
+                self.board_accuracy,
+                self.true_positives,
+                self.true_negatives,
+                self.false_positives,
+                self.false_negatives,
+            ]
+        )
 
 
 @t.inference_mode()
@@ -526,11 +533,11 @@ def zero_ablation(
 
 
 # %%
-# %%
 
 
-def generate_random_game(
-) -> (Tuple[Int[Tensor, "moves=60"], Bool[Tensor, "moves=60 rows=8 cols=8"]]):
+def generate_random_game() -> (
+    Tuple[Int[Tensor, "moves=60"], Bool[Tensor, "moves=60 rows=8 cols=8"]]
+):
     """Generate a random game of othello by choosing valid moves uniformly at random.
 
     Returns:
@@ -555,8 +562,7 @@ def generate_random_game(
 
 
 def generate_training_data(
-    n: int = 100,
-    seed: int = 42
+    n: int = 100, seed: int = 42
 ) -> Tuple[Int[Tensor, "n_games moves=60"], Bool[Tensor, "n_games moves=60 rows=8 cols=8"]]:
     """Generate training data.
 
@@ -569,8 +575,9 @@ def generate_training_data(
         valid_moves: the valid moves for each move, as a one-hot encoding of the board state
     """
     random.seed(seed)
-    training_data = joblib.Parallel(n_jobs=-1)(joblib.delayed(generate_random_game)()
-                                               for _ in trange(n))
+    training_data = joblib.Parallel(n_jobs=-1)(
+        joblib.delayed(generate_random_game)() for _ in trange(n)
+    )
 
     games_board_index = t.stack([game for game, _ in training_data])
     games_valid_moves = t.stack([valid_moves for _, valid_moves in training_data])
@@ -612,8 +619,9 @@ def make_training_data(
 
 
 # %%
-def get_training_data(
-) -> (Tuple[Int[Tensor, "n_games moves=60"], Float[Tensor, "n_games moves=60 rows=8 cols=8"]]):
+def get_training_data() -> (
+    Tuple[Int[Tensor, "n_games moves=60"], Float[Tensor, "n_games moves=60 rows=8 cols=8"]]
+):
     """Load the training data.
 
     Returns:
@@ -655,9 +663,9 @@ def compute_stats(
 
     stats = t.zeros(n_stats, 60, 8, 8, device=games_states.device)
     for board_states, valid_moves in tqdm(
-            zip(games_states[:n_games], games_valid_moves[:n_games]),
-            desc="Computing stats",
-            total=n_games,
+        zip(games_states[:n_games], games_valid_moves[:n_games]),
+        desc="Computing stats",
+        total=n_games,
     ):
         game_stats = [
             board_states == 0,  # empty
@@ -726,21 +734,24 @@ def swap_subspace(
 
     # Step 1. Remove the components that are in the space of the probe
     coefficients = einops.einsum(original, subspace, "batch d_model, dir d_model -> batch dir")
-    original = original - einops.einsum(coefficients, subspace,
-                                        "batch dir, dir d_model -> batch d_model")
+    original = original - einops.einsum(
+        coefficients, subspace, "batch dir, dir d_model -> batch d_model"
+    )
 
     # 2. Add the component of the from the new_cache
     coefficients = einops.einsum(patch, subspace, "batch d_model, dir d_model -> batch dir")
-    return original + einops.einsum(subspace, coefficients,
-                                    "dir d_model, batch dir -> batch d_model")
+    return original + einops.einsum(
+        subspace, coefficients, "dir d_model, batch dir -> batch d_model"
+    )
 
 
 # %%
 
+
 def make_deterministic(seed: int = 42):
     # Ensure deterministic behavior
     t.backends.cudnn.deterministic = True
-    random.seed(hash(f"setting random seeds {seed}") % 2 ** 32 - 1)
-    np.random.seed(hash(f"improves reproducibility {seed}") % 2 ** 32 - 1)
-    t.manual_seed(hash(f"by removing stochasticity {seed}") % 2 ** 32 - 1)
-    t.cuda.manual_seed_all(hash(f"so runs are repeatable {seed}") % 2 ** 32 - 1)
+    random.seed(hash(f"setting random seeds {seed}") % 2**32 - 1)
+    np.random.seed(hash(f"improves reproducibility {seed}") % 2**32 - 1)
+    t.manual_seed(hash(f"by removing stochasticity {seed}") % 2**32 - 1)
+    t.cuda.manual_seed_all(hash(f"so runs are repeatable {seed}") % 2**32 - 1)

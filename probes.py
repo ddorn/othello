@@ -1,6 +1,12 @@
+import copy
 import dataclasses
 import os
 
+from circuit import MagicTensor
+from othello_world.mechanistic_interpretability.mech_interp_othello_utils import (
+    plot_single_board,
+    plot_board,
+)
 from utils import *
 import wandb
 
@@ -377,6 +383,8 @@ class Probe(t.nn.Module):
     - over
     """
 
+    ACTIVATIONS_EXTRA_SHAPE: Tuple[int, ...] = ()
+
     probe: Float[Tensor, "probes options dmodel"]
 
     @dataclass
@@ -490,7 +498,9 @@ class Probe(t.nn.Module):
         tokens_loader = DataLoader(TensorDataset(tokens[:max_games]), batch_size=batch_size)
 
         # Big tensor to store the activations on cpu
-        activations = t.empty(max_games, self.model.cfg.d_model, device="cpu")
+        activations = t.empty(
+            max_games, *self.ACTIVATIONS_EXTRA_SHAPE, self.model.cfg.d_model, device="cpu"
+        )
         game = 0
         for (batch,) in tqdm(tokens_loader, desc="Computing activations"):
             activations[game : game + len(batch)] = self.get_activations(batch).cpu()
@@ -543,7 +553,7 @@ class Probe(t.nn.Module):
         return einops.einsum(
             self.probe,
             activations,
-            "probe option dmodel, batch ... dmodel -> batch probe ... option",
+            f"probe option dmodel, batch ... dmodel -> batch probe ... option",
         )
 
     # Step 3: Compute the loss
@@ -588,6 +598,10 @@ class Probe(t.nn.Module):
         correct = correct.to(device=self.config.device, dtype=t.long)
 
         # Compute the loss
+        if not ((correct >= 0).all() and (correct < logits.shape[-1]).all()):
+            # I had bugs about this too many times to not put a check. Otherwise, it crashes the kernel.
+            print("correct", correct, correct.min(), correct.max())
+            raise ValueError()
         loss = t.nn.functional.cross_entropy(
             logits.flatten(0, -2),  # all but the `option` dimension
             correct.flatten(),
@@ -625,11 +639,11 @@ class Probe(t.nn.Module):
         t.set_grad_enabled(True)
 
         # Optimizer
-        optim = t.optim.AdamW(
+        optim = t.optim.SGD(
             self.parameters(),
             lr=self.config.lr,
             weight_decay=self.config.wd,
-            betas=self.config.betas,
+            # betas=self.config.betas,
         )
 
         step = 0
@@ -697,12 +711,44 @@ class Probe(t.nn.Module):
         return probe
 
     def save(self, force: bool = False) -> None:
-        path = PROBE_DIR / f"{self.config.name}.pt"
+        path = PROBE_DIR / f"{self.config.name()}.pt"
         if path.exists() and not force:
             print(f"Warning: {path.resolve()} already exists. Not saving the probe.")
             return
         t.save(self.probe, path)
         print(f"Probe saved to {path.resolve()}")
+
+    def check_behaviour(
+        self, tokens: Int[Tensor, "batch token"], nb_games: int = 1
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Check that the probe behaves as expected on a subset of the data."""
+        print(self)
+
+        tokens = tokens[:nb_games]
+        print("Tokens shape:", tuple(tokens.shape))
+        print("• Expected:", f"(batch=1, tokens)")
+        print("•", tokens[0])
+
+        correct = self.get_correct_answers(tokens)
+        correct: Int[Tensor, "batch probe *activation"]
+        print("Correct shape:", tuple(correct.shape))
+        print(f"• Expected: (batch=1, probe={self.config.num_probes}, *activation)")
+        print("•", correct[0])
+
+        activations = self.get_activations(tokens)
+        activations: Float[Tensor, "batch probe *activation"]
+        print("Activations shape:", tuple(activations.shape))
+        print(f"• Expected: (batch=1, *activation, dmodel={self.model.cfg.d_model})")
+        print("•", activations[0, ..., :10], "truncated on dmodel")
+
+        logits = self(tokens)
+        logits: Float[Tensor, "batch probe *activation option"]
+        print("Logits shape:", tuple(logits.shape))
+        print(
+            f"• Expected: (batch=1, probe={self.config.num_probes}, *activation, option={self.config.options})"
+        )
+
+        return tokens.cpu(), correct.cpu(), activations.cpu(), logits.cpu()
 
 
 class OthelloProbe(Probe):
@@ -710,21 +756,6 @@ class OthelloProbe(Probe):
     class Config(Probe.Config):
         cell: str = "A1"
         options: int = 3
-
-        # @property
-        # def row(self) -> int:
-        #     return ord(self.cell[0].upper()) - ord("A")
-        #
-        # @property
-        # def col(self) -> int:
-        #     return int(self.cell[1])
-        #
-        # @property
-        # def options(self) -> int:
-        #     return 3 if self.has_blank else 2
-        #
-        def row_col(self) -> Tuple[int, int]:
-            return ord(self.cell[0].upper()) - ord("A"), int(self.cell[1])
 
         @property
         def trained_on(self):
@@ -742,7 +773,7 @@ class OthelloProbe(Probe):
             tokens.shape[1] == self.config.trained_on + 1
         ), f"Expected {self.config.trained_on + 1} moves, got {tokens.shape[1]}"
 
-        row, col = self.config.row_col()
+        row, col = board_label_to_row_col(self.config.cell)
 
         states = move_sequence_to_state(tokens_to_board(tokens), mode="mine-their")
         states = states[:, :, row, col]
@@ -762,6 +793,138 @@ class OthelloProbe(Probe):
         # Get the residual stream at the move where the probe is trained
         return cache[:, self.config.trained_on, :]
 
+    def check_behaviour(self, tokens: Int[Tensor, "batch token"], nb_games: int = 1) -> None:
+        out = tokens, correct, activations, logits = super().check_behaviour(tokens, nb_games)
+
+        predicted = logits.argmax(-1)
+        mistakes = (predicted != correct).int()
+        (
+            MagicTensor(t.stack([correct, predicted, mistakes], dim=1), ["game", "kind", "probe"])
+            .tokens_to_board("probe")
+            .plot(facet_labels=["Correct", "Predicted", "Mistakes"])
+        )
+
+        # plot_board(tokens_to_board(tokens)[0])
+        logits = t.cat([logits, predicted.unsqueeze(-1).float()], dim=-1)
+        (
+            MagicTensor(logits, ["game", "probe", "option"])
+            .tokens_to_board("probe", float("nan"))
+            .plot(facet_labels=["Blank", "Mine", "Their", "Correct"])
+        )
+
+        # return out
+
+
+class OthelloProbeWhenCellPlayed(OthelloProbe):
+    @dataclass
+    class Config(OthelloProbe.Config):
+        target_cell: str = "A1"
+        num_probes: int = 1
+        mode: Literal["mine-their", "black-white"] = "mine-their"
+
+        def name(self) -> str:
+            return f"probe-{self.cell}-L{self.layer}{self.probe_point}-when-{self.target_cell}"
+
+    config: Config
+
+    def select_activations(
+        self, tokens: Int[Tensor, "game move"], cache: Float[Tensor, "game move dmodel"]
+    ) -> Float[Tensor, "game dmodel"]:
+        # Get the residual stream at the move where the target cell is played
+        target_token = TOKEN_NAMES.index(self.config.target_cell)
+        activations = t.zeros(cache.shape[0], cache.shape[-1], device=cache.device)
+        for i, (game, act) in enumerate(zip(tokens, cache)):
+            mask = game == target_token
+            if not mask.sum() == 1:
+                print(f"Warning: no target ({self.config.target_cell}) in game", i)
+                # print("Game:", " ".join(TOKEN_NAMES[t] for t in game))
+                activations[i] = act[-1]
+            else:
+                activations[i] = act[mask]
+        return activations
+
+    def get_correct_answers(
+        self, tokens: Int[Tensor, "batch token"]
+    ) -> Int[Tensor, "batch probe *activation"]:
+        # assert (
+        #     tokens.shape[1] == self.config.trained_on + 1
+        # ), f"Expected {self.config.trained_on + 1} moves, got {tokens.shape[1]}"
+
+        row, col = board_label_to_row_col(self.config.cell)
+        target_token = TOKEN_NAMES.index(self.config.target_cell)
+        states = move_sequence_to_state(tokens_to_board(tokens), mode=self.config.mode)
+
+        good_states = t.zeros(tokens.shape[0], 1, device=tokens.device, dtype=t.long)
+
+        for i, (game, state) in enumerate(zip(tokens, states)):
+            mask = game == target_token
+            if not mask.sum() == 1:
+                print(f"Warning: no target ({self.config.target_cell}) in game", i)
+                # print("Game:", " ".join(TOKEN_NAMES[t] for t in game))
+                good_states[i] = 1 if np.random.rand() < 0.5 else -1
+            else:
+                good_states[i] = state[mask, row, col]
+        good_states = state_stack_to_correct_option(good_states)
+        good_states: Int[Tensor, "game 1"]  # Index of the correct cell state
+
+        if self.config.options == 2:  # Remove the blank option
+            # noinspection PyUnresolvedReferences
+            assert (good_states > 0).all(), "Blank option in the data!"
+            good_states -= 1
+
+        return good_states
+
+
+class OthelloProbePredictOnPlay(OthelloProbe):
+    ACTIVATIONS_EXTRA_SHAPE = (61,)
+
+    @dataclass
+    class Config(OthelloProbe.Config):
+        num_probes: int = 61
+        mode: Literal["mine-their", "black-white"] = "mine-their"
+
+        def name(self) -> str:
+            return f"probe-{self.cell}-L{self.layer}{self.probe_point}-predict-on-play"
+
+    config: Config
+
+    def select_activations(
+        self, tokens: Int[Tensor, "game move"], cache: Float[Tensor, "game move dmodel"]
+    ) -> Float[Tensor, "game dmodel"]:
+        activations = t.zeros(
+            cache.shape[0], self.config.num_probes, cache.shape[-1], device=cache.device
+        )
+
+        # sorted, indices = t.sort(tokens, dim=-1)
+        # range_ = t.arange(tokens.shape[0], device=tokens.device)
+        # activations[indices] = cache[sorted]
+        act: Tensor
+        for i, (game, act) in enumerate(zip(tokens, cache)):
+            for m, move in enumerate(game):
+                activations[i, move] = act[m]
+        return activations
+
+    def get_correct_answers(
+        self, tokens: Int[Tensor, "batch token"]
+    ) -> Int[Tensor, "batch probe *activation"]:
+        correct = t.zeros(tokens.shape[0], self.config.num_probes, device=tokens.device)
+        states = move_sequence_to_state(tokens_to_board(tokens), mode=self.config.mode)
+        row, col = board_label_to_row_col(self.config.cell)
+        states = states[:, :, row, col]
+
+        for i, (game, state) in enumerate(zip(tokens, states)):
+            correct[i, game] = state
+        return state_stack_to_correct_option(correct)
+
+    def activation_forward(
+        self, activations: Float[Tensor, "*activation dmodel"]
+    ) -> Float[Tensor, "batch probes *activation option"]:
+        return einops.einsum(
+            self.probe,
+            activations,
+            f"probe option dmodel, batch probe dmodel -> batch probe option",
+        )
+
 
 # Baselines
 
@@ -779,7 +942,7 @@ class ConstantProbe(OthelloProbe):
     ) -> Float[Tensor, "game first_moves option"]:
         assert tokens.dtype == t.int64, f"Expected int64, got {tokens.dtype}"
         l = t.tensor(self.logits, device=self.config.device, dtype=t.float32)
-        return l[None, None].expand(*tokens.shape, -1)
+        return l[None, None].expand(tokens.shape[0], self.config.num_probes, -1)
 
 
 class StatsProbe(OthelloProbe):
@@ -798,7 +961,7 @@ class StatsProbe(OthelloProbe):
             8,
             8,
         ), f"Expected stats to have shape (3, 60, 8, 8), got {stats.shape}"
-        row, col = self.config.row_col()
+        row, col = board_label_to_row_col(self.config.cell)
         if self.config.options == 2:
             stats = stats[1:]
         # We go from the probability of each cell to logits that correspond to the
@@ -816,7 +979,7 @@ class StatsProbe(OthelloProbe):
         return self.logits[None].expand(tokens.shape[0], -1, -1).to(self.config.device)
 
 
-def baselines(probes, val_data, type: Literal["random", "stats"] = "random"):
+def baselines(probes, val_data, type: Literal["mine", "their", "stats"] = "mine"):
     if type == "stats":
         stats = t.load(STATS_PATH)
     else:
@@ -824,13 +987,19 @@ def baselines(probes, val_data, type: Literal["random", "stats"] = "random"):
 
     baseline_probes = []
     for probe in probes:
-        config = OthelloProbe.Config(**dataclasses.asdict(probe.config))
+        config = copy.deepcopy(probe.config)
         config.use_wandb = False
-        if type == "random":
-            baseline_probes.append(ConstantProbe([1] * config.options, probe.model, config))
-        elif type == "stats":
+        if type == "stats":
             baseline_probes.append(StatsProbe(stats[:3], probe.model, config))
         else:
-            raise ValueError(f"Unknown baseline type {type}")
+            if config.options == 2:
+                logits = [1.1, 1.0]
+            elif config.options == 3:
+                logits = [0, 4.1, 4.0]
+            else:
+                logits = [1.0] * config.options
+            if type == "their":
+                logits[-2:] = logits[-2:][::-1]
+            baseline_probes.append(ConstantProbe(logits, probe.model, config))
 
     return t.stack([probe.validate(val_data) for probe in baseline_probes])
